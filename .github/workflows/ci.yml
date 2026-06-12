@@ -7,6 +7,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
 
     steps:
       - name: Checkout
@@ -23,14 +26,13 @@ jobs:
           pip install -e ".[dev,viz]"
 
       - name: Run formatting check
-        run: black --check src tests
+        run: python -m black --check src tests
 
       - name: Run import sorting check
-        run: isort --check-only src tests
+        run: python -m isort --check-only src tests
 
       - name: Run type checks
-        run: mypy src tests
+        run: python -m mypy src tests
 
       - name: Run tests
-        run: pytest
-
+        run: python -m pytest
