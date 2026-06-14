@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "datasets>=2.19",
   "black>=24.0",
   "isort>=5.13",
   "mypy>=1.8",
@@ -53,4 +54,3 @@ files = ["src", "tests"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
-

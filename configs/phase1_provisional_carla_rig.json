@@ -1,0 +1,29 @@
+{
+  "provenance": "Phase 1 provisional CARLA rig assumption for CARLA Autopilot Multimodal. Front-camera intrinsics are derived from the dataset card (800x600, FOV=90). LiDAR-to-camera extrinsics follow a documented standard CARLA-style front rig and must be validated visually before downstream use.",
+  "extrinsics_source_label": "assumed rig (documented CARLA provisional front rig)",
+  "sensor_rig_reference": {
+    "front_camera_carla_pose": {
+      "x": 1.5,
+      "y": 0.0,
+      "z": 2.4,
+      "pitch": 0.0,
+      "yaw": 0.0,
+      "roll": 0.0
+    },
+    "lidar_carla_pose": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 2.4,
+      "pitch": 0.0,
+      "yaw": 0.0,
+      "roll": 0.0
+    }
+  },
+  "projection_convention_note": "lidar_to_camera_extrinsics is expressed in the pinhole camera frame expected by src/perception/lidar_conversion.py, where Z is forward depth, X is image-right, and Y is image-down. With CARLA/UE sensor axes (X forward, Y right, Z up) and identical sensor orientation, the mapping is [X_cam, Y_cam, Z_cam] = [Y_ue, -Z_ue, X_ue] after translating from LiDAR origin to camera origin.",
+  "lidar_to_camera_extrinsics": [
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, -1.0, 0.0],
+    [1.0, 0.0, 0.0, -1.5],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}
