@@ -9,11 +9,13 @@ description = "CARLA-based autonomous driving perception project"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26",
+  "datasets>=2.19",
+  "requests>=2.31",
+  "torch>=2.4",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "datasets>=2.19",
   "black>=24.0",
   "isort>=5.13",
   "mypy>=1.8",
