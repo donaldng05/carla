@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pytest
 
@@ -102,6 +104,17 @@ def test_fill_depth_holes_fills_isolated_nan_with_local_median() -> None:
 
     assert np.isfinite(filled[1, 1])
     assert filled[1, 1] == 1.5
+
+
+def test_fill_depth_holes_keeps_all_nan_windows_quiet() -> None:
+    depth = np.full((3, 3), np.nan)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        filled = fill_depth_holes(depth, iterations=1, window_size=3)
+
+    assert np.isnan(filled).all()
+    assert not any(issubclass(warning.category, RuntimeWarning) for warning in caught)
 
 
 def test_make_validation_figure_creates_two_axes_without_error() -> None:
