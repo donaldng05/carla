@@ -168,7 +168,10 @@ def fill_depth_holes(
 
         padded = np.pad(filled, radius, mode="constant", constant_values=np.nan)
         windows = sliding_window_view(padded, (window_size, window_size))
-        local_values = np.nanmedian(windows, axis=(-1, -2))
+        finite_windows = np.isfinite(windows).any(axis=(-1, -2))
+        local_values = np.full(filled.shape, np.nan, dtype=np.float64)
+        if np.any(finite_windows):
+            local_values[finite_windows] = np.nanmedian(windows[finite_windows], axis=(-1, -2))
         nan_mask = np.isnan(filled)
         if not np.any(nan_mask):
             break
