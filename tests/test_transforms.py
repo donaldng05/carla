@@ -4,6 +4,7 @@ from hypothesis import strategies as st
 
 from src.transforms import (
     camera_to_vehicle,
+    carla_pose_to_matrix,
     compose_transforms,
     inverse_transform,
     transform_points,
@@ -98,6 +99,14 @@ def test_composed_transforms_match_sequential_application() -> None:
     composed = transform_points(points, compose_transforms(first, second))
 
     np.testing.assert_allclose(composed, sequential, atol=1e-12)
+
+
+def test_carla_pose_to_matrix_applies_location_and_yaw() -> None:
+    pose = carla_pose_to_matrix(x=1.0, y=2.0, z=3.0, yaw=90.0)
+
+    transformed = transform_points(np.array([1.0, 0.0, 0.0]), pose)
+
+    np.testing.assert_allclose(transformed, np.array([1.0, 3.0, 3.0]), atol=1e-12)
 
 
 @st.composite
