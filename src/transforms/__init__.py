@@ -29,6 +29,24 @@ def _as_transform_matrix(transform: np.ndarray | list[list[float]], name: str) -
     return matrix
 
 
+def inverse_transform(transform: np.ndarray | list[list[float]]) -> np.ndarray:
+    """Return the inverse of a 4x4 homogeneous transform."""
+
+    matrix = _as_transform_matrix(transform, "transform")
+    return np.linalg.inv(matrix)
+
+
+def compose_transforms(
+    first: np.ndarray | list[list[float]],
+    second: np.ndarray | list[list[float]],
+) -> np.ndarray:
+    """Compose two homogeneous transforms so the returned matrix applies first, then second."""
+
+    first_matrix = _as_transform_matrix(first, "first")
+    second_matrix = _as_transform_matrix(second, "second")
+    return second_matrix @ first_matrix
+
+
 def transform_points(
     points: np.ndarray | list[list[float]] | list[float], transform: np.ndarray | list[list[float]]
 ) -> np.ndarray:
@@ -68,5 +86,4 @@ def world_to_vehicle(
 ) -> np.ndarray:
     """Transform world-frame points into vehicle frame using a vehicle-to-world pose matrix."""
 
-    matrix = _as_transform_matrix(ego_pose, "ego_pose")
-    return transform_points(points, np.linalg.inv(matrix))
+    return transform_points(points, inverse_transform(ego_pose))

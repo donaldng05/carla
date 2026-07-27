@@ -4,11 +4,7 @@ from typing import Any
 
 import pytest
 
-from src.data.split_audit import (
-    audit_huggingface_split_run_ids,
-    format_split_audit_report,
-    main,
-)
+from src.data.split_audit import audit_huggingface_split_run_ids, format_split_audit_report, main
 
 
 def test_format_split_audit_report_mentions_overlap_and_split_summary() -> None:
