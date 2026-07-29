@@ -34,6 +34,23 @@ CARLA_CLASS_NAMES = {
     4: "pedestrian",
 }
 DEFAULT_CLASS_IDS = tuple(CARLA_CLASS_NAMES)
+BEV_CLASS_NAMES = {
+    1: "building",
+    4: "pedestrian",
+    6: "road line",
+    7: "road",
+    8: "sidewalk",
+    10: "vehicle",
+}
+BEV_CLASS_COLORS = {
+    UNKNOWN_CLASS: "#ffffff",
+    1: "#b9c7d8",
+    4: "#f2a23a",
+    6: "#6aa5ff",
+    7: "#777777",
+    8: "#c7c7c7",
+    10: "#c83f49",
+}
 
 
 @dataclass(frozen=True)
@@ -71,6 +88,17 @@ class Phase2CarlaEvalArtifacts:
     shadow_clusters: Path
     run_summary: Path
     bev_images: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class FrameSkipExample:
+    """Compact example of a skipped frame error for notebook diagnostics."""
+
+    frame_index: int
+    run_id: str | None
+    frame: int | None
+    error_type: str
+    message: str
 
 
 def stream_huggingface_samples(dataset_name: str, split: str) -> Iterable[Mapping[str, Any]]:
@@ -150,6 +178,25 @@ def _topdown_semantic_image(grid: SemanticOccupancyGrid) -> np.ndarray:
     return image.T
 
 
+def _crop_panels_to_occupied(
+    panels: list[np.ndarray],
+    *,
+    padding: int = 8,
+) -> list[np.ndarray]:
+    occupied = np.zeros(panels[0].shape, dtype=bool)
+    for panel in panels:
+        occupied |= panel != UNKNOWN_CLASS
+    rows, cols = np.nonzero(occupied)
+    if rows.size == 0:
+        return panels
+
+    row_start = max(int(rows.min()) - padding, 0)
+    row_end = min(int(rows.max()) + padding + 1, panels[0].shape[0])
+    col_start = max(int(cols.min()) - padding, 0)
+    col_end = min(int(cols.max()) + padding + 1, panels[0].shape[1])
+    return [panel[row_start:row_end, col_start:col_end] for panel in panels]
+
+
 def save_bev_comparison(
     *,
     baseline: SemanticOccupancyGrid,
@@ -171,33 +218,40 @@ def save_bev_comparison(
     except ImportError as exc:  # pragma: no cover - optional visualization dependency
         raise ImportError("matplotlib is required for BEV comparison output") from exc
 
-    colors = {
-        UNKNOWN_CLASS: "#ffffff",
-        7: "#777777",
-        10: "#c83f49",
-        4: "#f2a23a",
-    }
-    classes = sorted(set(colors) | set(class_names))
+    panel_arrays = [
+        _topdown_semantic_image(baseline),
+        _topdown_semantic_image(temporal),
+        _topdown_semantic_image(target),
+    ]
+    panel_arrays = _crop_panels_to_occupied(panel_arrays)
+    colors = BEV_CLASS_COLORS
+    display_names = BEV_CLASS_NAMES | dict(class_names)
+    observed_classes = {int(value) for panel in panel_arrays for value in np.unique(panel)}
+    classes = sorted(set(colors) | set(class_names) | observed_classes)
     class_to_index = {class_id: index for index, class_id in enumerate(classes)}
     cmap = mcolors.ListedColormap([colors.get(class_id, "#4c78a8") for class_id in classes])
     panels = [
-        ("Baseline", _topdown_semantic_image(baseline)),
-        ("Temporal fusion", _topdown_semantic_image(temporal)),
-        ("Target proxy", _topdown_semantic_image(target)),
+        ("Baseline", panel_arrays[0]),
+        ("Temporal fusion", panel_arrays[1]),
+        ("Target proxy", panel_arrays[2]),
     ]
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
     for ax, (panel_title, panel) in zip(axes, panels):
-        indexed = np.vectorize(class_to_index.get)(panel)
+        indexed = np.vectorize(class_to_index.__getitem__)(panel)
         ax.imshow(indexed, origin="lower", cmap=cmap, interpolation="nearest")
         ax.set_title(panel_title)
         ax.axis("off")
 
     handles = [
-        mpatches.Patch(color=colors.get(class_id, "#4c78a8"), label=class_names[class_id])
-        for class_id in class_names
+        mpatches.Patch(
+            color=colors.get(class_id, "#4c78a8"),
+            label=display_names.get(class_id, f"class {class_id}"),
+        )
+        for class_id in classes
+        if class_id != UNKNOWN_CLASS
     ]
     fig.suptitle(title)
     fig.legend(handles=handles, loc="lower center", ncol=max(1, len(handles)))
@@ -243,6 +297,8 @@ def run_bounded_carla_iou_evaluation(
     processed_count = 0
     skipped_count = 0
     skipped_errors: dict[str, int] = {}
+    skipped_examples: list[FrameSkipExample] = []
+    visualization_errors: dict[str, int] = {}
 
     for frame_index, sample in enumerate(islice(samples, eval_config.max_frames)):
         try:
@@ -283,6 +339,7 @@ def run_bounded_carla_iou_evaluation(
                 improved=fused,
                 metadata=dict(processed["metadata"]),
             )
+            processed_count += 1
 
             should_save_bev = len(bev_images) < eval_config.bev_frame_count
             should_save_flagged = evaluator.records[-1].flagged and len(bev_images) < (
@@ -290,24 +347,45 @@ def run_bounded_carla_iou_evaluation(
             )
             if should_save_bev or should_save_flagged:
                 frame_label = processed["metadata"].get("frame", frame_index)
-                bev_images.append(
-                    save_bev_comparison(
-                        baseline=baseline,
-                        temporal=temporal,
-                        target=target,
-                        output_path=bev_dir / f"bev_frame_{frame_index:05d}_{frame_label}.png",
-                        title=f"Frame {frame_label} projected-depth proxy occupancy",
-                        class_names=class_names,
+                try:
+                    bev_images.append(
+                        save_bev_comparison(
+                            baseline=baseline,
+                            temporal=temporal,
+                            target=target,
+                            output_path=bev_dir / f"bev_frame_{frame_index:05d}_{frame_label}.png",
+                            title=f"Frame {frame_label} projected-depth proxy occupancy",
+                            class_names=class_names,
+                        )
                     )
-                )
-            processed_count += 1
+                except Exception as exc:
+                    error_name = type(exc).__name__
+                    visualization_errors[error_name] = visualization_errors.get(error_name, 0) + 1
         except Exception as exc:
             skipped_count += 1
             error_name = type(exc).__name__
             skipped_errors[error_name] = skipped_errors.get(error_name, 0) + 1
+            if len(skipped_examples) < 5:
+                skipped_examples.append(
+                    FrameSkipExample(
+                        frame_index=frame_index,
+                        run_id=None if sample is None else sample.get("run_id"),
+                        frame=None if sample is None else sample.get("frame"),
+                        error_type=error_name,
+                        message=str(exc),
+                    )
+                )
 
     if processed_count == 0:
-        raise RuntimeError("No frames were processed successfully; cannot write IoU summaries")
+        details = "; ".join(
+            f"{example.error_type} at index {example.frame_index} "
+            f"(run_id={example.run_id}, frame={example.frame}): {example.message}"
+            for example in skipped_examples
+        )
+        raise RuntimeError(
+            "No frames were processed successfully; cannot write IoU summaries. "
+            f"Skipped errors: {skipped_errors}. Examples: {details}"
+        )
 
     baseline_summary = summarize_iou(baseline_iou_results)
     temporal_summary = summarize_iou(temporal_iou_results)
@@ -335,6 +413,8 @@ def run_bounded_carla_iou_evaluation(
             "processed_frame_count": processed_count,
             "skipped_frame_count": skipped_count,
             "skipped_errors": skipped_errors,
+            "skipped_examples": [example.__dict__ for example in skipped_examples],
+            "visualization_errors": visualization_errors,
             "occupancy_threshold": eval_config.occupancy_threshold,
             "disagreement_threshold": eval_config.disagreement_threshold,
             "target_proxy": (

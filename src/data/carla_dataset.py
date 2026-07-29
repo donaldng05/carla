@@ -26,9 +26,43 @@ from src.perception.modality_verification import (
 )
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_CALIBRATION_CONFIG_PATH = Path("configs/phase1_provisional_carla_rig.json")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CALIBRATION_CONFIG_PATH = REPO_ROOT / "configs" / "phase1_provisional_carla_rig.json"
 IMAGENET_RGB_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_RGB_STD = (0.229, 0.224, 0.225)
+CARLA_CITYSCAPES_PALETTE: dict[tuple[int, int, int], int] = {
+    (0, 0, 0): 0,
+    (70, 70, 70): 1,
+    (100, 40, 40): 2,
+    (55, 90, 80): 3,
+    (220, 20, 60): 4,
+    (153, 153, 153): 5,
+    (157, 234, 50): 6,
+    (128, 64, 128): 7,
+    (244, 35, 232): 8,
+    (107, 142, 35): 9,
+    (0, 0, 142): 10,
+    (102, 102, 156): 11,
+    (220, 220, 0): 12,
+    (70, 130, 180): 13,
+    (81, 0, 81): 14,
+    (150, 100, 100): 15,
+    (230, 150, 140): 16,
+    (180, 165, 180): 17,
+    (250, 170, 30): 18,
+    (110, 190, 160): 19,
+    (170, 120, 50): 20,
+    (45, 60, 150): 21,
+    (145, 170, 100): 22,
+    (152, 251, 152): 23,
+    (190, 153, 153): 24,
+    (0, 0, 70): 25,
+    # The streamed dataset uses Cityscapes-style colors for vehicle-family actors
+    # that are not distinct classes in the Phase 2 canonical occupancy taxonomy.
+    (0, 60, 100): 10,  # bus -> vehicle
+    (0, 0, 230): 10,  # motorcycle -> vehicle
+    (119, 11, 32): 10,  # bicycle -> vehicle
+}
 
 
 @dataclass(frozen=True)
@@ -119,14 +153,23 @@ def _segmentation_to_mask(segmentation: Any, *, sample_id: str) -> np.ndarray:
     if mask.ndim == 3 and mask.shape[2] == 1:
         return mask[..., 0].astype(np.int64)
     if mask.ndim == 3 and mask.shape[2] >= 3:
-        first = mask[..., 0]
-        if not np.array_equal(first, mask[..., 1]) or not np.array_equal(first, mask[..., 2]):
+        rgb = mask[..., :3].astype(np.uint8, copy=False)
+        first = rgb[..., 0]
+        if np.array_equal(first, rgb[..., 1]) and np.array_equal(first, rgb[..., 2]):
+            return first.astype(np.int64)
+
+        decoded = np.full(first.shape, -1, dtype=np.int64)
+        for color, class_id in CARLA_CITYSCAPES_PALETTE.items():
+            decoded[np.all(rgb == np.asarray(color, dtype=np.uint8), axis=-1)] = class_id
+        unknown = decoded < 0
+        if np.any(unknown):
             LOGGER.warning(
-                "Segmentation sample %s is multi-channel and non-identical across channels; "
-                "using channel 0 as the mask.",
+                "Segmentation sample %s contains %d pixels with unknown colorized labels; "
+                "leaving those pixels as -1.",
                 sample_id,
+                int(np.count_nonzero(unknown)),
             )
-        return first.astype(np.int64)
+        return decoded
     raise ValueError("Segmentation image must be 2D or HxWxC")
 
 

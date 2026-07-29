@@ -42,12 +42,24 @@ def occupancy_disagreement_rate(
     *,
     occupancy_threshold: float = 0.5,
 ) -> float:
-    """Return the fraction of voxels with different binary occupancy decisions."""
+    """Return disagreement over the observed occupied union.
+
+    Sparse LiDAR occupancy grids are mostly empty. Normalizing by the full grid
+    hides meaningful differences, so shadow-mode diagnostics use voxels that
+    either model marks occupied as the denominator.
+    """
 
     if baseline.occupied.shape != improved.occupancy_score.shape:
         raise ValueError("baseline and improved occupancy grids must have matching shapes")
     improved_occupied = improved.occupancy_score >= occupancy_threshold
-    return float(np.mean(baseline.occupied != improved_occupied))
+    observed_union = baseline.occupied | improved_occupied
+    union_count = int(np.count_nonzero(observed_union))
+    if union_count == 0:
+        return 0.0
+    disagreement_count = int(
+        np.count_nonzero((baseline.occupied != improved_occupied) & observed_union)
+    )
+    return float(disagreement_count / union_count)
 
 
 def extract_shadow_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:

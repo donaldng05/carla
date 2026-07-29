@@ -29,7 +29,7 @@ def test_occupancy_disagreement_rate_counts_binary_differences() -> None:
 
     disagreement = occupancy_disagreement_rate(baseline, improved)
 
-    assert disagreement == 0.25
+    assert disagreement == 1 / 3
 
 
 def test_shadow_mode_evaluator_flags_and_keeps_metadata() -> None:
