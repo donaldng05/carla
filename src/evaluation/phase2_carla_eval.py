@@ -41,10 +41,14 @@ from src.perception.temporal_fusion import (
 )
 from src.transforms import carla_pose_to_matrix
 
+ROAD_CLASS_ID = 7
+VEHICLE_CLASS_ID = 10
+PEDESTRIAN_CLASS_ID = 4
+
 CARLA_CLASS_NAMES = {
-    7: "road",
-    10: "vehicle",
-    4: "pedestrian",
+    ROAD_CLASS_ID: "road",
+    VEHICLE_CLASS_ID: "vehicle",
+    PEDESTRIAN_CLASS_ID: "pedestrian",
 }
 DEFAULT_CLASS_IDS = tuple(CARLA_CLASS_NAMES)
 BEV_CLASS_NAMES = {
@@ -727,8 +731,8 @@ def _vehicle_masks(
     baseline: SemanticOccupancyGrid,
     target: SemanticOccupancyGrid,
 ) -> tuple[np.ndarray, np.ndarray]:
-    baseline_vehicle = baseline.occupied & (baseline.semantic == 10)
-    target_vehicle = target.occupied & (target.semantic == 10)
+    baseline_vehicle = baseline.occupied & (baseline.semantic == VEHICLE_CLASS_ID)
+    target_vehicle = target.occupied & (target.semantic == VEHICLE_CLASS_ID)
     return baseline_vehicle, target_vehicle
 
 
@@ -812,7 +816,8 @@ def score_scenario_memory_candidates(
         )
         baseline_vehicle, target_vehicle = _vehicle_masks(anchor.grid, target)
         new_vehicle_voxels = int(np.count_nonzero(target_vehicle & ~baseline_vehicle))
-        vehicle_union = baseline_iou.get(10, ClassIoU(10, 0, 0, 1.0)).union
+        vehicle_iou = baseline_iou.get(VEHICLE_CLASS_ID)
+        vehicle_union = 0 if vehicle_iou is None else vehicle_iou.union
         metadata = anchor.metadata or {}
         coverage = _metadata_depth_coverage(metadata, anchor.grid)
         candidate_inputs.append(

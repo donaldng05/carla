@@ -323,6 +323,28 @@ def test_scenario_memory_selector_catches_all_synthetic_conditions() -> None:
     assert anchor_one.new_vehicle_voxel_count >= 1
 
 
+def test_scenario_memory_vehicle_change_requires_vehicle_iou_class() -> None:
+    spec, frames = _scenario_frames()
+    config = ScenarioMemoryEvalConfig(
+        max_scan_frames=4,
+        anchors_per_slice=2,
+        past_window=2,
+        future_window=2,
+        grid_spec=spec,
+        class_ids=(7, 4),
+        min_vehicle_union=1,
+        occupancy_threshold=0.25,
+        turn_steer_threshold=0.15,
+        dense_traffic_min_nearby=10,
+        disagreement_threshold=0.01,
+    )
+
+    candidates, _ = score_scenario_memory_candidates(frames, config=config)
+
+    assert candidates
+    assert all("vehicle_change" not in candidate.anchor.slice_names for candidate in candidates)
+
+
 def test_scenario_memory_evaluation_writes_jsonl_and_per_slice_iou(tmp_path: Path) -> None:
     spec, frames = _scenario_frames()
     config = ScenarioMemoryEvalConfig(
