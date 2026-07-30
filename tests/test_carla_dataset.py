@@ -17,6 +17,7 @@ from src.data import (
     collate_carla_samples,
     validate_processed_dataset,
 )
+from src.data.carla_dataset import DEFAULT_CALIBRATION_CONFIG_PATH
 
 
 def _make_sample(*, segmentation_value: int = 1) -> dict[str, Any]:
@@ -57,6 +58,12 @@ def test_dataset_returns_aligned_multimodal_sample() -> None:
     assert item["metadata"]["depth_summary"]["coverage"] > 0.0
 
 
+def test_default_calibration_config_path_is_repo_absolute() -> None:
+    assert DEFAULT_CALIBRATION_CONFIG_PATH.is_absolute()
+    assert DEFAULT_CALIBRATION_CONFIG_PATH.name == "phase1_provisional_carla_rig.json"
+    assert DEFAULT_CALIBRATION_CONFIG_PATH.exists()
+
+
 def test_dataset_hole_fill_is_optional_postprocess() -> None:
     sample = _make_sample()
     sample["lidar"] = np.array(
@@ -88,6 +95,35 @@ def test_dataset_applies_segmentation_remap() -> None:
     item = dataset[0]
 
     assert torch.unique(item["segmentation"]).tolist() == [3]
+
+
+def test_dataset_decodes_colorized_carla_segmentation() -> None:
+    sample = _make_sample()
+    sample["seg_front"] = np.zeros((6, 8, 4), dtype=np.uint8)
+    sample["seg_front"][..., :3] = np.array([128, 64, 128], dtype=np.uint8)
+    sample["seg_front"][..., 3] = 255
+    sample["seg_front"][0, 0, :3] = np.array([0, 0, 142], dtype=np.uint8)
+
+    dataset = CarlaMultimodalDataset([sample])
+
+    item = dataset[0]
+
+    assert torch.unique(item["segmentation"]).tolist() == [7, 10]
+
+
+def test_dataset_maps_cityscapes_vehicle_family_colors_to_vehicle_class() -> None:
+    sample = _make_sample()
+    sample["seg_front"] = np.zeros((6, 8, 4), dtype=np.uint8)
+    sample["seg_front"][..., :3] = np.array([0, 60, 100], dtype=np.uint8)
+    sample["seg_front"][..., 3] = 255
+    sample["seg_front"][0, 0, :3] = np.array([0, 0, 230], dtype=np.uint8)
+    sample["seg_front"][0, 1, :3] = np.array([119, 11, 32], dtype=np.uint8)
+
+    dataset = CarlaMultimodalDataset([sample])
+
+    item = dataset[0]
+
+    assert torch.unique(item["segmentation"]).tolist() == [10]
 
 
 def test_bc_preprocessing_resizes_and_normalizes() -> None:

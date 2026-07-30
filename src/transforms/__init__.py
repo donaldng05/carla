@@ -29,6 +29,84 @@ def _as_transform_matrix(transform: np.ndarray | list[list[float]], name: str) -
     return matrix
 
 
+def inverse_transform(transform: np.ndarray | list[list[float]]) -> np.ndarray:
+    """Return the inverse of a 4x4 homogeneous transform."""
+
+    matrix = _as_transform_matrix(transform, "transform")
+    return np.linalg.inv(matrix)
+
+
+def compose_transforms(
+    first: np.ndarray | list[list[float]],
+    second: np.ndarray | list[list[float]],
+) -> np.ndarray:
+    """Compose two homogeneous transforms so the returned matrix applies first, then second."""
+
+    first_matrix = _as_transform_matrix(first, "first")
+    second_matrix = _as_transform_matrix(second, "second")
+    return second_matrix @ first_matrix
+
+
+def carla_pose_to_matrix(
+    *,
+    x: float,
+    y: float,
+    z: float,
+    pitch: float = 0.0,
+    yaw: float = 0.0,
+    roll: float = 0.0,
+    degrees: bool = True,
+) -> np.ndarray:
+    """Build a CARLA/Unreal-style vehicle-to-world homogeneous pose matrix.
+
+    CARLA metadata stores location in meters and rotation as pitch/yaw/roll.
+    The matrix applies intrinsic roll, pitch, then yaw rotations in a right-handed
+    numeric convention suitable for consistent relative-frame testing.
+    """
+
+    angles = np.array([roll, pitch, yaw], dtype=np.float64)
+    if degrees:
+        angles = np.deg2rad(angles)
+    roll_rad, pitch_rad, yaw_rad = angles
+
+    cr = float(np.cos(roll_rad))
+    sr = float(np.sin(roll_rad))
+    cp = float(np.cos(pitch_rad))
+    sp = float(np.sin(pitch_rad))
+    cy = float(np.cos(yaw_rad))
+    sy = float(np.sin(yaw_rad))
+
+    rotation_x = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cr, -sr],
+            [0.0, sr, cr],
+        ],
+        dtype=np.float64,
+    )
+    rotation_y = np.array(
+        [
+            [cp, 0.0, sp],
+            [0.0, 1.0, 0.0],
+            [-sp, 0.0, cp],
+        ],
+        dtype=np.float64,
+    )
+    rotation_z = np.array(
+        [
+            [cy, -sy, 0.0],
+            [sy, cy, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = rotation_z @ rotation_y @ rotation_x
+    matrix[:3, 3] = np.array([x, y, z], dtype=np.float64)
+    return matrix
+
+
 def transform_points(
     points: np.ndarray | list[list[float]] | list[float], transform: np.ndarray | list[list[float]]
 ) -> np.ndarray:
@@ -68,5 +146,4 @@ def world_to_vehicle(
 ) -> np.ndarray:
     """Transform world-frame points into vehicle frame using a vehicle-to-world pose matrix."""
 
-    matrix = _as_transform_matrix(ego_pose, "ego_pose")
-    return transform_points(points, np.linalg.inv(matrix))
+    return transform_points(points, inverse_transform(ego_pose))
