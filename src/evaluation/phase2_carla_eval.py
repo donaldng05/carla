@@ -16,8 +16,14 @@ from src.data.carla_dataset import (
     CarlaMultimodalDataset,
     build_occupancy_preprocessing_config,
 )
-from src.evaluation.iou import ClassIoU, compute_semantic_iou, summarize_iou, write_iou_summary_json
-from src.evaluation.shadow_mode import ShadowModeEvaluator
+from src.evaluation.iou import (
+    ClassIoU,
+    compute_semantic_iou,
+    iou_table,
+    summarize_iou,
+    write_iou_summary_json,
+)
+from src.evaluation.shadow_mode import ShadowModeEvaluator, occupancy_disagreement_rate
 from src.perception.modality_verification import estimate_front_camera_intrinsics
 from src.perception.occupancy_grid import (
     UNKNOWN_CLASS,
@@ -167,6 +173,116 @@ class FuturePseudoEvalArtifacts:
     ablation_summary: Path
     bev_images: tuple[Path, ...]
     alignment_images: tuple[Path, ...]
+
+
+SCENARIO_MEMORY_SLICE_NAMES = (
+    "vehicle_change",
+    "sparse_depth",
+    "turning",
+    "dense_traffic",
+    "high_disagreement",
+)
+
+
+@dataclass(frozen=True)
+class ScenarioMemoryEvalConfig:
+    """Configuration for scenario-sliced temporal-memory evaluation."""
+
+    dataset_name: str = DEFAULT_DATASET_NAME
+    split: str = "validation"
+    max_scan_frames: int = 2000
+    anchors_per_slice: int = 50
+    output_dir: str | Path = "outputs/phase2/scenario_memory"
+    min_vehicle_union: int = 1
+    sparse_depth_quantile: float = 0.25
+    turn_steer_threshold: float = 0.15
+    turn_yaw_delta_threshold_degrees: float = 5.0
+    dense_traffic_min_nearby: int = 10
+    occupancy_threshold: float = 0.4
+    disagreement_threshold: float = 0.05
+    bev_frame_count_per_slice: int = 2
+    past_window: int = 5
+    future_window: int = 5
+    fusion_weights: tuple[float, ...] = DEFAULT_STRICT_FUSION_WEIGHTS
+    preprocessing: CarlaDataPreprocessingConfig | None = None
+    grid_spec: OccupancyGridSpec | None = None
+    class_ids: tuple[int, ...] = DEFAULT_CLASS_IDS
+    class_names: Mapping[int, str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_scan_frames < 1:
+            raise ValueError("max_scan_frames must be at least 1")
+        if self.anchors_per_slice < 1:
+            raise ValueError("anchors_per_slice must be at least 1")
+        if self.min_vehicle_union < 1:
+            raise ValueError("min_vehicle_union must be at least 1")
+        if not 0.0 <= self.sparse_depth_quantile <= 1.0:
+            raise ValueError("sparse_depth_quantile must be between 0 and 1")
+        if self.bev_frame_count_per_slice < 0:
+            raise ValueError("bev_frame_count_per_slice must be non-negative")
+        if self.past_window < 1:
+            raise ValueError("past_window must be at least 1")
+        if self.future_window < 1:
+            raise ValueError("future_window must be at least 1")
+        if not self.fusion_weights:
+            raise ValueError("fusion_weights must contain at least one weight")
+        if self.class_names is None:
+            object.__setattr__(self, "class_names", CARLA_CLASS_NAMES)
+
+
+@dataclass(frozen=True)
+class ScenarioMemoryEvalArtifacts:
+    """Paths written by scenario-sliced temporal-memory evaluation."""
+
+    eval_summary: Path
+    by_slice_iou: Path
+    selected_anchors: Path
+    bev_images: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class ScenarioMemoryAnchor:
+    """One anchor frame selected for scenario-memory evaluation."""
+
+    anchor_index: int
+    run_id: str | None
+    frame: int | None
+    slice_names: tuple[str, ...]
+    depth_coverage: float
+    abs_steer: float
+    yaw_delta_degrees: float
+    nearby_vehicles_50m: int
+    total_npc_vehicles: int
+    disagreement_rate: float
+    vehicle_union: int
+    new_vehicle_voxel_count: int
+
+    def to_json_record(self, *, slice_name: str) -> dict[str, Any]:
+        return {
+            "slice": slice_name,
+            "anchor_index": self.anchor_index,
+            "run_id": self.run_id,
+            "frame": self.frame,
+            "all_slice_labels": list(self.slice_names),
+            "depth_coverage": self.depth_coverage,
+            "abs_steer": self.abs_steer,
+            "yaw_delta_degrees": self.yaw_delta_degrees,
+            "nearby_vehicles_50m": self.nearby_vehicles_50m,
+            "total_npc_vehicles": self.total_npc_vehicles,
+            "disagreement_rate": self.disagreement_rate,
+            "vehicle_union": self.vehicle_union,
+            "new_vehicle_voxel_count": self.new_vehicle_voxel_count,
+        }
+
+
+@dataclass(frozen=True)
+class _ScenarioMemoryCandidate:
+    anchor: ScenarioMemoryAnchor
+    baseline: SemanticOccupancyGrid
+    temporal: SemanticOccupancyGrid
+    target: SemanticOccupancyGrid
+    baseline_iou: Mapping[int, ClassIoU]
+    temporal_iou: Mapping[int, ClassIoU]
 
 
 @dataclass(frozen=True)
@@ -490,6 +606,7 @@ def _collect_occupancy_frames(
     *,
     config: FuturePseudoEvalConfig,
     raw_samples: Iterable[Mapping[str, Any]] | None,
+    max_raw_frames: int | None = None,
 ) -> tuple[list[OccupancyFrame], dict[str, Any]]:
     preprocessing = config.preprocessing or build_occupancy_preprocessing_config()
     spec = config.grid_spec or OccupancyGridSpec()
@@ -497,7 +614,11 @@ def _collect_occupancy_frames(
     if samples is None:
         samples = stream_huggingface_samples(config.dataset_name, config.split)
 
-    requested_frames = config.anchor_count + config.past_window - 1 + config.future_window
+    requested_frames = (
+        max_raw_frames
+        if max_raw_frames is not None
+        else config.anchor_count + config.past_window - 1 + config.future_window
+    )
     frames: list[OccupancyFrame] = []
     skipped_errors: dict[str, int] = {}
     skipped_examples: list[FrameSkipExample] = []
@@ -553,6 +674,414 @@ def _ablation_row_score(row: Mapping[str, Any]) -> tuple[float, float]:
     vehicle_score = -1.0 if int(vehicle.get("union", 0)) == 0 else float(vehicle.get("iou", 0.0))
     road_score = -1.0 if int(road.get("union", 0)) == 0 else float(road.get("iou", 0.0))
     return vehicle_score, road_score
+
+
+def _metadata_float(metadata: Mapping[str, Any] | None, key: str, default: float = 0.0) -> float:
+    if metadata is None:
+        return default
+    value = metadata.get(key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metadata_int(metadata: Mapping[str, Any] | None, key: str, default: int = 0) -> int:
+    if metadata is None:
+        return default
+    value = metadata.get(key, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metadata_depth_coverage(
+    metadata: Mapping[str, Any] | None,
+    grid: SemanticOccupancyGrid,
+) -> float:
+    if metadata is not None:
+        depth_summary = metadata.get("depth_summary")
+        if isinstance(depth_summary, Mapping):
+            for key in ("coverage", "valid_fraction", "valid_ratio", "observed_fraction"):
+                if key in depth_summary:
+                    try:
+                        return float(depth_summary[key])
+                    except (TypeError, ValueError):
+                        break
+    return float(np.count_nonzero(grid.occupied) / grid.occupied.size)
+
+
+def _yaw_delta_degrees(frames: Sequence[OccupancyFrame], anchor_index: int) -> float:
+    if anchor_index <= 0:
+        return 0.0
+    current = frames[anchor_index].metadata or {}
+    previous = frames[anchor_index - 1].metadata or {}
+    current_yaw = _metadata_float(current, "rotation_yaw", 0.0)
+    previous_yaw = _metadata_float(previous, "rotation_yaw", current_yaw)
+    delta = (current_yaw - previous_yaw + 180.0) % 360.0 - 180.0
+    return abs(float(delta))
+
+
+def _vehicle_masks(
+    baseline: SemanticOccupancyGrid,
+    target: SemanticOccupancyGrid,
+) -> tuple[np.ndarray, np.ndarray]:
+    baseline_vehicle = baseline.occupied & (baseline.semantic == 10)
+    target_vehicle = target.occupied & (target.semantic == 10)
+    return baseline_vehicle, target_vehicle
+
+
+def _scenario_iou_payload(
+    baseline_summary: Mapping[int, ClassIoU],
+    temporal_summary: Mapping[int, ClassIoU],
+    *,
+    class_names: Mapping[int, str],
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for class_id in sorted(baseline_summary):
+        baseline = baseline_summary[class_id]
+        temporal = temporal_summary[class_id]
+        informative = baseline.union > 0 or temporal.union > 0
+        rows.append(
+            {
+                "class_id": class_id,
+                "class_name": class_names.get(class_id, str(class_id)),
+                "baseline_iou": baseline.iou,
+                "temporal_iou": temporal.iou,
+                "delta": temporal.iou - baseline.iou,
+                "baseline_intersection": baseline.intersection,
+                "baseline_union": baseline.union,
+                "temporal_intersection": temporal.intersection,
+                "temporal_union": temporal.union,
+                "informative": informative,
+            }
+        )
+    return {"classes": rows}
+
+
+def score_scenario_memory_candidates(
+    frames: Sequence[OccupancyFrame],
+    *,
+    config: ScenarioMemoryEvalConfig | None = None,
+) -> tuple[list[_ScenarioMemoryCandidate], dict[str, Any]]:
+    """Score all context-valid anchors and assign temporal-memory scenario labels."""
+
+    eval_config = config or ScenarioMemoryEvalConfig()
+    if not frames:
+        return [], {"candidate_count": 0, "sparse_depth_threshold": None}
+
+    spec = eval_config.grid_spec or frames[0].grid.spec
+    anchors = _anchor_indices(
+        frame_count=len(frames),
+        anchor_count=len(frames),
+        past_window=eval_config.past_window,
+        future_window=eval_config.future_window,
+    )
+    if not anchors:
+        return [], {"candidate_count": 0, "sparse_depth_threshold": None}
+
+    candidate_inputs: list[dict[str, Any]] = []
+    for anchor_index in anchors:
+        anchor = frames[anchor_index]
+        past_frames = frames[anchor_index - eval_config.past_window + 1 : anchor_index + 1]
+        future_frames = frames[anchor_index : anchor_index + eval_config.future_window]
+        target = union_grids_in_ego_frame(
+            future_frames,
+            target_ego_pose=anchor.ego_pose,
+            spec=spec,
+        )
+        fused = fuse_occupancy_frames(
+            tuple(reversed(past_frames)), weights=eval_config.fusion_weights
+        )
+        temporal = fused_to_semantic_grid(
+            fused,
+            occupancy_threshold=eval_config.occupancy_threshold,
+        )
+        baseline_iou = compute_semantic_iou(
+            anchor.grid,
+            target,
+            class_ids=eval_config.class_ids,
+            occupancy_threshold=eval_config.occupancy_threshold,
+        )
+        temporal_iou = compute_semantic_iou(
+            fused,
+            target,
+            class_ids=eval_config.class_ids,
+            occupancy_threshold=eval_config.occupancy_threshold,
+        )
+        baseline_vehicle, target_vehicle = _vehicle_masks(anchor.grid, target)
+        new_vehicle_voxels = int(np.count_nonzero(target_vehicle & ~baseline_vehicle))
+        vehicle_union = baseline_iou.get(10, ClassIoU(10, 0, 0, 1.0)).union
+        metadata = anchor.metadata or {}
+        coverage = _metadata_depth_coverage(metadata, anchor.grid)
+        candidate_inputs.append(
+            {
+                "anchor_index": anchor_index,
+                "baseline": anchor.grid,
+                "temporal": temporal,
+                "target": target,
+                "baseline_iou": baseline_iou,
+                "temporal_iou": temporal_iou,
+                "depth_coverage": coverage,
+                "new_vehicle_voxels": new_vehicle_voxels,
+                "vehicle_union": vehicle_union,
+                "abs_steer": abs(_metadata_float(metadata, "steer", 0.0)),
+                "yaw_delta_degrees": _yaw_delta_degrees(frames, anchor_index),
+                "nearby_vehicles_50m": _metadata_int(metadata, "nearby_vehicles_50m", 0),
+                "total_npc_vehicles": _metadata_int(metadata, "total_npc_vehicles", 0),
+                "disagreement_rate": occupancy_disagreement_rate(
+                    anchor.grid,
+                    fused,
+                    occupancy_threshold=eval_config.occupancy_threshold,
+                ),
+                "metadata": metadata,
+            }
+        )
+
+    sparse_threshold = float(
+        np.quantile(
+            [candidate["depth_coverage"] for candidate in candidate_inputs],
+            eval_config.sparse_depth_quantile,
+        )
+    )
+    candidates: list[_ScenarioMemoryCandidate] = []
+    for candidate in candidate_inputs:
+        slice_names: list[str] = []
+        if (
+            candidate["vehicle_union"] >= eval_config.min_vehicle_union
+            and candidate["new_vehicle_voxels"] >= eval_config.min_vehicle_union
+        ):
+            slice_names.append("vehicle_change")
+        if candidate["depth_coverage"] <= sparse_threshold:
+            slice_names.append("sparse_depth")
+        if (
+            candidate["abs_steer"] >= eval_config.turn_steer_threshold
+            or candidate["yaw_delta_degrees"] >= eval_config.turn_yaw_delta_threshold_degrees
+        ):
+            slice_names.append("turning")
+        if (
+            candidate["nearby_vehicles_50m"] >= eval_config.dense_traffic_min_nearby
+            or candidate["total_npc_vehicles"] >= eval_config.dense_traffic_min_nearby
+        ):
+            slice_names.append("dense_traffic")
+        if candidate["disagreement_rate"] > eval_config.disagreement_threshold:
+            slice_names.append("high_disagreement")
+        if not slice_names:
+            continue
+
+        metadata = candidate["metadata"]
+        candidates.append(
+            _ScenarioMemoryCandidate(
+                anchor=ScenarioMemoryAnchor(
+                    anchor_index=int(candidate["anchor_index"]),
+                    run_id=metadata.get("run_id"),
+                    frame=metadata.get("frame"),
+                    slice_names=tuple(slice_names),
+                    depth_coverage=float(candidate["depth_coverage"]),
+                    abs_steer=float(candidate["abs_steer"]),
+                    yaw_delta_degrees=float(candidate["yaw_delta_degrees"]),
+                    nearby_vehicles_50m=int(candidate["nearby_vehicles_50m"]),
+                    total_npc_vehicles=int(candidate["total_npc_vehicles"]),
+                    disagreement_rate=float(candidate["disagreement_rate"]),
+                    vehicle_union=int(candidate["vehicle_union"]),
+                    new_vehicle_voxel_count=int(candidate["new_vehicle_voxels"]),
+                ),
+                baseline=candidate["baseline"],
+                temporal=candidate["temporal"],
+                target=candidate["target"],
+                baseline_iou=candidate["baseline_iou"],
+                temporal_iou=candidate["temporal_iou"],
+            )
+        )
+
+    return candidates, {
+        "candidate_count": len(candidate_inputs),
+        "labeled_candidate_count": len(candidates),
+        "sparse_depth_threshold": sparse_threshold,
+    }
+
+
+def _select_candidates_by_slice(
+    candidates: Sequence[_ScenarioMemoryCandidate],
+    *,
+    anchors_per_slice: int,
+) -> dict[str, list[_ScenarioMemoryCandidate]]:
+    selected: dict[str, list[_ScenarioMemoryCandidate]] = {
+        slice_name: [] for slice_name in SCENARIO_MEMORY_SLICE_NAMES
+    }
+    for candidate in candidates:
+        for slice_name in candidate.anchor.slice_names:
+            if len(selected[slice_name]) < anchors_per_slice:
+                selected[slice_name].append(candidate)
+    return selected
+
+
+def _write_selected_anchors_jsonl(
+    path: Path,
+    selected_by_slice: Mapping[str, Sequence[_ScenarioMemoryCandidate]],
+) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for slice_name, candidates in selected_by_slice.items():
+            for candidate in candidates:
+                handle.write(
+                    json.dumps(candidate.anchor.to_json_record(slice_name=slice_name)) + "\n"
+                )
+    return path
+
+
+def run_scenario_memory_evaluation(
+    *,
+    config: ScenarioMemoryEvalConfig | None = None,
+    raw_samples: Iterable[Mapping[str, Any]] | None = None,
+    frames: Sequence[OccupancyFrame] | None = None,
+) -> ScenarioMemoryEvalArtifacts:
+    """Evaluate future-pseudo IoU on anchors where temporal memory should matter."""
+
+    eval_config = config or ScenarioMemoryEvalConfig()
+    class_names = eval_config.class_names or CARLA_CLASS_NAMES
+    output_dir = Path(eval_config.output_dir)
+    bev_dir = output_dir / "scenario_memory_bev"
+    collection_summary: dict[str, Any] = {}
+
+    frame_sequence: Sequence[OccupancyFrame]
+    if frames is None:
+        collection_config = FuturePseudoEvalConfig(
+            dataset_name=eval_config.dataset_name,
+            split=eval_config.split,
+            anchor_count=eval_config.max_scan_frames,
+            output_dir=eval_config.output_dir,
+            occupancy_threshold=eval_config.occupancy_threshold,
+            disagreement_threshold=eval_config.disagreement_threshold,
+            past_window=eval_config.past_window,
+            future_window=eval_config.future_window,
+            preprocessing=eval_config.preprocessing,
+            grid_spec=eval_config.grid_spec,
+            class_ids=eval_config.class_ids,
+            class_names=class_names,
+        )
+        loaded_frames, collection_summary = _collect_occupancy_frames(
+            config=collection_config,
+            raw_samples=raw_samples,
+            max_raw_frames=eval_config.max_scan_frames,
+        )
+        frame_sequence = loaded_frames
+    else:
+        frame_sequence = frames
+        collection_summary = {
+            "requested_raw_frame_count": len(frame_sequence),
+            "processed_raw_frame_count": len(frame_sequence),
+            "skipped_frame_count": 0,
+            "skipped_errors": {},
+            "skipped_examples": [],
+        }
+
+    candidates, candidate_summary = score_scenario_memory_candidates(
+        frame_sequence,
+        config=eval_config,
+    )
+    selected_by_slice = _select_candidates_by_slice(
+        candidates,
+        anchors_per_slice=eval_config.anchors_per_slice,
+    )
+
+    by_slice_payload: dict[str, Any] = {
+        "evaluation_name": "scenario_memory_future_pseudo_iou",
+        "target_proxy": (
+            "future union of projected-depth semantic occupancy grids transformed into "
+            "the anchor ego frame; not dense simulator 3D ground truth"
+        ),
+        "class_ids": {
+            str(class_id): class_names.get(class_id, str(class_id))
+            for class_id in eval_config.class_ids
+        },
+        "slices": {},
+    }
+    bev_images: list[Path] = []
+    visualization_errors: dict[str, int] = {}
+
+    for slice_name, selected in selected_by_slice.items():
+        baseline_results = [candidate.baseline_iou for candidate in selected]
+        temporal_results = [candidate.temporal_iou for candidate in selected]
+        baseline_summary = summarize_iou(baseline_results)
+        temporal_summary = summarize_iou(temporal_results)
+        by_slice_payload["slices"][slice_name] = {
+            "selected_anchor_count": len(selected),
+            **_scenario_iou_payload(
+                baseline_summary,
+                temporal_summary,
+                class_names=class_names,
+            ),
+        }
+
+        saved_for_slice = 0
+        for candidate in selected:
+            if saved_for_slice >= eval_config.bev_frame_count_per_slice:
+                break
+            frame_label = candidate.anchor.frame or candidate.anchor.anchor_index
+            try:
+                bev_images.append(
+                    save_bev_comparison(
+                        baseline=candidate.baseline,
+                        temporal=candidate.temporal,
+                        target=candidate.target,
+                        output_path=bev_dir
+                        / slice_name
+                        / f"{slice_name}_{candidate.anchor.anchor_index:05d}_{frame_label}.png",
+                        title=f"{slice_name}: frame {frame_label} future pseudo-label occupancy",
+                        class_names=class_names,
+                        panel_titles=("Baseline t", "Past temporal fusion", "Future pseudo-label"),
+                    )
+                )
+                saved_for_slice += 1
+            except Exception as exc:
+                error_name = type(exc).__name__
+                visualization_errors[error_name] = visualization_errors.get(error_name, 0) + 1
+
+    selected_path = _write_selected_anchors_jsonl(
+        output_dir / "scenario_memory_selected_anchors.jsonl",
+        selected_by_slice,
+    )
+    by_slice_path = _write_json(output_dir / "scenario_memory_by_slice_iou.json", by_slice_payload)
+    summary_path = _write_json(
+        output_dir / "scenario_memory_eval_summary.json",
+        {
+            "evaluation_name": "scenario_memory_future_pseudo_iou",
+            "dataset_name": eval_config.dataset_name,
+            "split": eval_config.split,
+            "max_scan_frames": eval_config.max_scan_frames,
+            "anchors_per_slice": eval_config.anchors_per_slice,
+            "past_window": eval_config.past_window,
+            "future_window": eval_config.future_window,
+            "occupancy_threshold": eval_config.occupancy_threshold,
+            "disagreement_threshold": eval_config.disagreement_threshold,
+            "fusion_weights": list(eval_config.fusion_weights),
+            "slice_names": list(SCENARIO_MEMORY_SLICE_NAMES),
+            "selected_anchor_counts": {
+                slice_name: len(selected) for slice_name, selected in selected_by_slice.items()
+            },
+            "selection_thresholds": {
+                "min_vehicle_union": eval_config.min_vehicle_union,
+                "sparse_depth_quantile": eval_config.sparse_depth_quantile,
+                "sparse_depth_threshold": candidate_summary["sparse_depth_threshold"],
+                "turn_steer_threshold": eval_config.turn_steer_threshold,
+                "turn_yaw_delta_threshold_degrees": eval_config.turn_yaw_delta_threshold_degrees,
+                "dense_traffic_min_nearby": eval_config.dense_traffic_min_nearby,
+            },
+            "visualization_errors": visualization_errors,
+            "bev_images": [str(path) for path in bev_images],
+            **candidate_summary,
+            **collection_summary,
+        },
+    )
+
+    return ScenarioMemoryEvalArtifacts(
+        eval_summary=summary_path,
+        by_slice_iou=by_slice_path,
+        selected_anchors=selected_path,
+        bev_images=tuple(bev_images),
+    )
 
 
 def run_future_pseudo_label_evaluation(

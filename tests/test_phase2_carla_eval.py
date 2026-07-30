@@ -12,11 +12,14 @@ pytest.importorskip("torch")
 from src.evaluation.phase2_carla_eval import (
     FuturePseudoEvalConfig,
     Phase2CarlaEvalConfig,
+    ScenarioMemoryEvalConfig,
     _anchor_indices,
     ego_pose_from_sample,
     iter_shadow_records,
     run_bounded_carla_iou_evaluation,
     run_future_pseudo_label_evaluation,
+    run_scenario_memory_evaluation,
+    score_scenario_memory_candidates,
     union_grids_in_ego_frame,
 )
 from src.perception.occupancy_grid import UNKNOWN_CLASS, OccupancyGridSpec, SemanticOccupancyGrid
@@ -117,6 +120,46 @@ def _single_voxel_grid(
     return SemanticOccupancyGrid(spec, occupied, semantic, counts)
 
 
+def _multi_voxel_grid(
+    spec: OccupancyGridSpec,
+    voxels: list[tuple[tuple[int, int, int], int]],
+) -> SemanticOccupancyGrid:
+    occupied = np.zeros(spec.shape, dtype=bool)
+    semantic = np.full(spec.shape, UNKNOWN_CLASS, dtype=np.int16)
+    counts = np.zeros(spec.shape, dtype=np.uint16)
+    for voxel, label in voxels:
+        occupied[voxel] = True
+        semantic[voxel] = label
+        counts[voxel] = 1
+    return SemanticOccupancyGrid(spec, occupied, semantic, counts)
+
+
+def _occupancy_frame(
+    spec: OccupancyGridSpec,
+    *,
+    frame: int,
+    voxels: list[tuple[tuple[int, int, int], int]],
+    coverage: float,
+    steer: float = 0.0,
+    yaw: float = 0.0,
+    nearby: int = 0,
+    total_vehicles: int = 0,
+) -> OccupancyFrame:
+    return OccupancyFrame(
+        _multi_voxel_grid(spec, voxels),
+        carla_pose_to_matrix(x=0.0, y=0.0, z=0.0, pitch=0.0, yaw=0.0, roll=0.0),
+        metadata={
+            "run_id": "scenario-test",
+            "frame": frame,
+            "steer": steer,
+            "rotation_yaw": yaw,
+            "nearby_vehicles_50m": nearby,
+            "total_npc_vehicles": total_vehicles,
+            "depth_summary": {"coverage": coverage},
+        },
+    )
+
+
 def test_future_pseudo_target_unions_future_grids_in_anchor_frame() -> None:
     spec = OccupancyGridSpec(
         voxel_size_m=1.0,
@@ -205,3 +248,125 @@ def test_future_pseudo_evaluation_writes_artifacts_and_ablation_rows(tmp_path: P
 
     baseline = json.loads(artifacts.baseline_iou.read_text(encoding="utf-8"))
     assert {row["class_name"] for row in baseline["classes"]} == {"road", "vehicle", "pedestrian"}
+
+
+def _scenario_frames() -> tuple[OccupancyGridSpec, list[OccupancyFrame]]:
+    spec = OccupancyGridSpec(
+        voxel_size_m=1.0,
+        x_range_m=(0.0, 4.0),
+        y_range_m=(0.0, 4.0),
+        z_range_m=(0.0, 2.0),
+    )
+    frames = [
+        _occupancy_frame(
+            spec,
+            frame=0,
+            voxels=[((0, 0, 0), 10)],
+            coverage=0.9,
+            yaw=0.0,
+        ),
+        _occupancy_frame(
+            spec,
+            frame=1,
+            voxels=[((1, 1, 0), 7)],
+            coverage=0.01,
+            steer=0.2,
+            yaw=8.0,
+            nearby=12,
+            total_vehicles=12,
+        ),
+        _occupancy_frame(
+            spec,
+            frame=2,
+            voxels=[((1, 1, 0), 7), ((2, 1, 0), 10)],
+            coverage=0.8,
+            yaw=8.0,
+        ),
+        _occupancy_frame(
+            spec,
+            frame=3,
+            voxels=[((1, 2, 0), 7)],
+            coverage=0.7,
+            yaw=8.0,
+        ),
+    ]
+    return spec, frames
+
+
+def test_scenario_memory_selector_catches_all_synthetic_conditions() -> None:
+    spec, frames = _scenario_frames()
+    config = ScenarioMemoryEvalConfig(
+        max_scan_frames=4,
+        anchors_per_slice=2,
+        past_window=2,
+        future_window=2,
+        grid_spec=spec,
+        class_ids=(7, 10, 4),
+        min_vehicle_union=1,
+        occupancy_threshold=0.25,
+        turn_steer_threshold=0.15,
+        dense_traffic_min_nearby=10,
+        disagreement_threshold=0.01,
+    )
+
+    candidates, summary = score_scenario_memory_candidates(frames, config=config)
+
+    assert summary["candidate_count"] == 2
+    anchor_one = next(candidate.anchor for candidate in candidates if candidate.anchor.frame == 1)
+    assert set(anchor_one.slice_names) == {
+        "vehicle_change",
+        "sparse_depth",
+        "turning",
+        "dense_traffic",
+        "high_disagreement",
+    }
+    assert anchor_one.new_vehicle_voxel_count >= 1
+
+
+def test_scenario_memory_evaluation_writes_jsonl_and_per_slice_iou(tmp_path: Path) -> None:
+    spec, frames = _scenario_frames()
+    config = ScenarioMemoryEvalConfig(
+        max_scan_frames=4,
+        anchors_per_slice=1,
+        output_dir=tmp_path,
+        past_window=2,
+        future_window=2,
+        grid_spec=spec,
+        class_ids=(7, 10, 4),
+        min_vehicle_union=1,
+        occupancy_threshold=0.25,
+        disagreement_threshold=0.01,
+        bev_frame_count_per_slice=0,
+    )
+
+    artifacts = run_scenario_memory_evaluation(config=config, frames=frames)
+
+    assert artifacts.eval_summary.exists()
+    assert artifacts.by_slice_iou.exists()
+    assert artifacts.selected_anchors.exists()
+    assert artifacts.bev_images == ()
+
+    records = [
+        json.loads(line)
+        for line in artifacts.selected_anchors.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {record["slice"] for record in records} >= {
+        "vehicle_change",
+        "sparse_depth",
+        "turning",
+        "dense_traffic",
+        "high_disagreement",
+    }
+
+    by_slice = json.loads(artifacts.by_slice_iou.read_text(encoding="utf-8"))
+    vehicle_rows = {
+        row["class_name"]: row for row in by_slice["slices"]["vehicle_change"]["classes"]
+    }
+    assert set(vehicle_rows) == {"road", "vehicle", "pedestrian"}
+    assert vehicle_rows["vehicle"]["informative"] is True
+    assert vehicle_rows["pedestrian"]["informative"] is False
+
+    summary = json.loads(artifacts.eval_summary.read_text(encoding="utf-8"))
+    assert summary["selected_anchor_counts"]["vehicle_change"] == 1
+    assert summary["selection_thresholds"]["dense_traffic_min_nearby"] == 10
