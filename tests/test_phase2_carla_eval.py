@@ -13,6 +13,7 @@ from src.evaluation.phase2_carla_eval import (
     FuturePseudoEvalConfig,
     Phase2CarlaEvalConfig,
     ScenarioMemoryEvalConfig,
+    _all_context_valid_anchor_indices,
     _anchor_indices,
     ego_pose_from_sample,
     iter_shadow_records,
@@ -323,11 +324,14 @@ def test_scenario_memory_selector_catches_all_synthetic_conditions() -> None:
     assert anchor_one.new_vehicle_voxel_count >= 1
 
 
-def test_scenario_memory_vehicle_change_requires_vehicle_iou_class() -> None:
+def test_scenario_memory_vehicle_change_is_scene_based_without_vehicle_iou_class(
+    tmp_path: Path,
+) -> None:
     spec, frames = _scenario_frames()
     config = ScenarioMemoryEvalConfig(
         max_scan_frames=4,
         anchors_per_slice=2,
+        output_dir=tmp_path,
         past_window=2,
         future_window=2,
         grid_spec=spec,
@@ -342,7 +346,34 @@ def test_scenario_memory_vehicle_change_requires_vehicle_iou_class() -> None:
     candidates, _ = score_scenario_memory_candidates(frames, config=config)
 
     assert candidates
-    assert all("vehicle_change" not in candidate.anchor.slice_names for candidate in candidates)
+    anchor_one = next(candidate.anchor for candidate in candidates if candidate.anchor.frame == 1)
+    assert "vehicle_change" in anchor_one.slice_names
+    assert anchor_one.scene_vehicle_union >= 1
+
+    artifacts = run_scenario_memory_evaluation(config=config, frames=frames)
+    records = [
+        json.loads(line)
+        for line in artifacts.selected_anchors.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    vehicle_records = [record for record in records if record["slice"] == "vehicle_change"]
+    assert vehicle_records
+    assert "scene_vehicle_union" in vehicle_records[0]
+    assert "vehicle_union" not in vehicle_records[0]
+
+    by_slice = json.loads(artifacts.by_slice_iou.read_text(encoding="utf-8"))
+    vehicle_rows = {
+        row["class_name"]: row for row in by_slice["slices"]["vehicle_change"]["classes"]
+    }
+    assert set(vehicle_rows) == {"road", "pedestrian"}
+
+
+def test_scenario_memory_scans_all_context_valid_anchors() -> None:
+    assert _all_context_valid_anchor_indices(
+        frame_count=8,
+        past_window=2,
+        future_window=3,
+    ) == (1, 2, 3, 4, 5)
 
 
 def test_scenario_memory_evaluation_writes_jsonl_and_per_slice_iou(tmp_path: Path) -> None:
@@ -391,4 +422,5 @@ def test_scenario_memory_evaluation_writes_jsonl_and_per_slice_iou(tmp_path: Pat
 
     summary = json.loads(artifacts.eval_summary.read_text(encoding="utf-8"))
     assert summary["selected_anchor_counts"]["vehicle_change"] == 1
+    assert summary["selection_thresholds"]["min_scene_vehicle_union"] == 1
     assert summary["selection_thresholds"]["dense_traffic_min_nearby"] == 10

@@ -190,7 +190,12 @@ SCENARIO_MEMORY_SLICE_NAMES = (
 
 @dataclass(frozen=True)
 class ScenarioMemoryEvalConfig:
-    """Configuration for scenario-sliced temporal-memory evaluation."""
+    """Configuration for heuristic, non-exclusive scenario-memory evaluation slices.
+
+    Slice selection is scene-derived from occupancy grids and frame metadata. The
+    reported IoU rows still follow ``class_ids`` so callers can restrict metrics
+    without changing which scene anchors are eligible for scenario slices.
+    """
 
     dataset_name: str = DEFAULT_DATASET_NAME
     split: str = "validation"
@@ -246,7 +251,7 @@ class ScenarioMemoryEvalArtifacts:
 
 @dataclass(frozen=True)
 class ScenarioMemoryAnchor:
-    """One anchor frame selected for scenario-memory evaluation."""
+    """One anchor frame selected for one or more heuristic scenario slices."""
 
     anchor_index: int
     run_id: str | None
@@ -258,7 +263,7 @@ class ScenarioMemoryAnchor:
     nearby_vehicles_50m: int
     total_npc_vehicles: int
     disagreement_rate: float
-    vehicle_union: int
+    scene_vehicle_union: int
     new_vehicle_voxel_count: int
 
     def to_json_record(self, *, slice_name: str) -> dict[str, Any]:
@@ -274,7 +279,7 @@ class ScenarioMemoryAnchor:
             "nearby_vehicles_50m": self.nearby_vehicles_50m,
             "total_npc_vehicles": self.total_npc_vehicles,
             "disagreement_rate": self.disagreement_rate,
-            "vehicle_union": self.vehicle_union,
+            "scene_vehicle_union": self.scene_vehicle_union,
             "new_vehicle_voxel_count": self.new_vehicle_voxel_count,
         }
 
@@ -606,6 +611,22 @@ def _anchor_indices(
     return tuple(range(first_anchor, min(last_anchor_exclusive, first_anchor + anchor_count)))
 
 
+def _all_context_valid_anchor_indices(
+    *,
+    frame_count: int,
+    past_window: int,
+    future_window: int,
+) -> tuple[int, ...]:
+    """Return every anchor with enough past and future context in the scanned buffer."""
+
+    return _anchor_indices(
+        frame_count=frame_count,
+        anchor_count=frame_count,
+        past_window=past_window,
+        future_window=future_window,
+    )
+
+
 def _collect_occupancy_frames(
     *,
     config: FuturePseudoEvalConfig,
@@ -769,16 +790,15 @@ def score_scenario_memory_candidates(
     *,
     config: ScenarioMemoryEvalConfig | None = None,
 ) -> tuple[list[_ScenarioMemoryCandidate], dict[str, Any]]:
-    """Score all context-valid anchors and assign temporal-memory scenario labels."""
+    """Score all context-valid anchors and assign heuristic scenario labels."""
 
     eval_config = config or ScenarioMemoryEvalConfig()
     if not frames:
         return [], {"candidate_count": 0, "sparse_depth_threshold": None}
 
     spec = eval_config.grid_spec or frames[0].grid.spec
-    anchors = _anchor_indices(
+    anchors = _all_context_valid_anchor_indices(
         frame_count=len(frames),
-        anchor_count=len(frames),
         past_window=eval_config.past_window,
         future_window=eval_config.future_window,
     )
@@ -815,9 +835,8 @@ def score_scenario_memory_candidates(
             occupancy_threshold=eval_config.occupancy_threshold,
         )
         baseline_vehicle, target_vehicle = _vehicle_masks(anchor.grid, target)
+        scene_vehicle_union = int(np.count_nonzero(baseline_vehicle | target_vehicle))
         new_vehicle_voxels = int(np.count_nonzero(target_vehicle & ~baseline_vehicle))
-        vehicle_iou = baseline_iou.get(VEHICLE_CLASS_ID)
-        vehicle_union = 0 if vehicle_iou is None else vehicle_iou.union
         metadata = anchor.metadata or {}
         coverage = _metadata_depth_coverage(metadata, anchor.grid)
         candidate_inputs.append(
@@ -829,8 +848,8 @@ def score_scenario_memory_candidates(
                 "baseline_iou": baseline_iou,
                 "temporal_iou": temporal_iou,
                 "depth_coverage": coverage,
+                "scene_vehicle_union": scene_vehicle_union,
                 "new_vehicle_voxels": new_vehicle_voxels,
-                "vehicle_union": vehicle_union,
                 "abs_steer": abs(_metadata_float(metadata, "steer", 0.0)),
                 "yaw_delta_degrees": _yaw_delta_degrees(frames, anchor_index),
                 "nearby_vehicles_50m": _metadata_int(metadata, "nearby_vehicles_50m", 0),
@@ -854,7 +873,7 @@ def score_scenario_memory_candidates(
     for candidate in candidate_inputs:
         slice_names: list[str] = []
         if (
-            candidate["vehicle_union"] >= eval_config.min_vehicle_union
+            candidate["scene_vehicle_union"] >= eval_config.min_vehicle_union
             and candidate["new_vehicle_voxels"] >= eval_config.min_vehicle_union
         ):
             slice_names.append("vehicle_change")
@@ -889,7 +908,7 @@ def score_scenario_memory_candidates(
                     nearby_vehicles_50m=int(candidate["nearby_vehicles_50m"]),
                     total_npc_vehicles=int(candidate["total_npc_vehicles"]),
                     disagreement_rate=float(candidate["disagreement_rate"]),
-                    vehicle_union=int(candidate["vehicle_union"]),
+                    scene_vehicle_union=int(candidate["scene_vehicle_union"]),
                     new_vehicle_voxel_count=int(candidate["new_vehicle_voxels"]),
                 ),
                 baseline=candidate["baseline"],
@@ -1067,7 +1086,7 @@ def run_scenario_memory_evaluation(
                 slice_name: len(selected) for slice_name, selected in selected_by_slice.items()
             },
             "selection_thresholds": {
-                "min_vehicle_union": eval_config.min_vehicle_union,
+                "min_scene_vehicle_union": eval_config.min_vehicle_union,
                 "sparse_depth_quantile": eval_config.sparse_depth_quantile,
                 "sparse_depth_threshold": candidate_summary["sparse_depth_threshold"],
                 "turn_steer_threshold": eval_config.turn_steer_threshold,
