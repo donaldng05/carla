@@ -21,6 +21,7 @@ from src.evaluation.phase2_carla_eval import (
     run_future_pseudo_label_evaluation,
     run_scenario_memory_evaluation,
     score_scenario_memory_candidates,
+    stream_huggingface_samples,
     union_grids_in_ego_frame,
 )
 from src.perception.occupancy_grid import UNKNOWN_CLASS, OccupancyGridSpec, SemanticOccupancyGrid
@@ -58,6 +59,21 @@ def _sample(*, frame: int, segmentation_value: int = 7, location_x: float = 0.0)
         "weather_sun_altitude_angle": 45.0,
         "nearby_vehicles_50m": 3,
     }
+
+
+def test_stream_huggingface_samples_uses_small_parquet_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_load_dataset(*args: Any, **kwargs: Any) -> list[dict[str, int]]:
+        captured.update(kwargs)
+        return [{"frame": 1}]
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+
+    assert list(stream_huggingface_samples("dataset", "validation")) == [{"frame": 1}]
+    assert captured == {"split": "validation", "streaming": True, "batch_size": 1}
 
 
 def test_ego_pose_from_sample_uses_location_fields() -> None:

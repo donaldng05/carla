@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
@@ -310,7 +311,11 @@ def stream_huggingface_samples(dataset_name: str, split: str) -> Iterable[Mappin
 
     from datasets import load_dataset
 
-    dataset = load_dataset(dataset_name, split=split, streaming=True)
+    # The dataset's Parquet row groups are large enough that the default
+    # row-group-sized streaming batches can exhaust notebook memory before the
+    # first sample is yielded. Keep the Arrow record batches small so bounded
+    # evaluators remain genuinely bounded in memory.
+    dataset = load_dataset(dataset_name, split=split, streaming=True, batch_size=1)
     return iter(dataset)
 
 
@@ -941,6 +946,201 @@ def _select_candidates_by_slice(
     return selected
 
 
+def _stream_scenario_memory_selection(
+    *,
+    config: ScenarioMemoryEvalConfig,
+    class_names: Mapping[int, str],
+) -> tuple[dict[str, list[_ScenarioMemoryCandidate]], dict[str, Any], dict[str, Any]]:
+    """Select scenario anchors with a rolling window instead of storing all grids."""
+
+    preprocessing = config.preprocessing or build_occupancy_preprocessing_config()
+    coverages: list[float] = []
+    skipped_errors: dict[str, int] = {}
+    skipped_examples: list[FrameSkipExample] = []
+
+    # A first lightweight pass obtains the global sparse-depth threshold. Only
+    # scalar coverage values are retained from this pass.
+    for raw_index, sample in enumerate(
+        islice(
+            stream_huggingface_samples(config.dataset_name, config.split), config.max_scan_frames
+        )
+    ):
+        try:
+            processed, _ = _processed_sample_from_raw(sample, preprocessing=preprocessing)
+            depth_summary = processed["metadata"].get("depth_summary", {})
+            coverages.append(float(depth_summary.get("coverage", 0.0)))
+        except Exception as exc:
+            error_name = type(exc).__name__
+            skipped_errors[error_name] = skipped_errors.get(error_name, 0) + 1
+            if len(skipped_examples) < 5:
+                skipped_examples.append(
+                    FrameSkipExample(
+                        frame_index=raw_index,
+                        run_id=sample.get("run_id"),
+                        frame=sample.get("frame"),
+                        error_type=error_name,
+                        message=str(exc),
+                    )
+                )
+
+    sparse_threshold = (
+        float(np.quantile(coverages, config.sparse_depth_quantile)) if coverages else None
+    )
+    selected: dict[str, list[_ScenarioMemoryCandidate]] = {
+        slice_name: [] for slice_name in SCENARIO_MEMORY_SLICE_NAMES
+    }
+    context_window = config.past_window + config.future_window - 1
+    window: deque[OccupancyFrame] = deque(maxlen=context_window)
+    processed_count = 0
+    candidate_count = 0
+    labeled_candidate_count = 0
+    second_skipped_errors: dict[str, int] = {}
+    second_skipped_examples: list[FrameSkipExample] = []
+
+    # Re-open the stream and retain only enough frames for one context-valid
+    # anchor. At most past_window + future_window grids live at once.
+    for raw_index, sample in enumerate(
+        islice(
+            stream_huggingface_samples(config.dataset_name, config.split), config.max_scan_frames
+        )
+    ):
+        try:
+            processed, extrinsics = _processed_sample_from_raw(sample, preprocessing=preprocessing)
+            grid = _grid_from_processed_sample(
+                processed,
+                extrinsics=extrinsics,
+                fov_degrees=preprocessing.fov_degrees,
+                spec=config.grid_spec or OccupancyGridSpec(),
+            )
+            window.append(
+                OccupancyFrame(
+                    grid,
+                    ego_pose_from_sample(sample),
+                    metadata=dict(processed["metadata"]),
+                )
+            )
+            processed_count += 1
+        except Exception as exc:
+            error_name = type(exc).__name__
+            second_skipped_errors[error_name] = second_skipped_errors.get(error_name, 0) + 1
+            if len(second_skipped_examples) < 5:
+                second_skipped_examples.append(
+                    FrameSkipExample(
+                        frame_index=raw_index,
+                        run_id=sample.get("run_id"),
+                        frame=sample.get("frame"),
+                        error_type=error_name,
+                        message=str(exc),
+                    )
+                )
+            continue
+
+        if len(window) < context_window:
+            continue
+
+        candidate_count += 1
+        local_frames = tuple(window)
+        local_anchor = config.past_window - 1
+        anchor = local_frames[local_anchor]
+        past_frames = local_frames[: config.past_window]
+        future_frames = local_frames[local_anchor:]
+        spec = config.grid_spec or anchor.grid.spec
+        target = union_grids_in_ego_frame(
+            future_frames,
+            target_ego_pose=anchor.ego_pose,
+            spec=spec,
+        )
+        fused = fuse_occupancy_frames(tuple(reversed(past_frames)), weights=config.fusion_weights)
+        temporal = fused_to_semantic_grid(fused, occupancy_threshold=config.occupancy_threshold)
+        baseline_iou = compute_semantic_iou(
+            anchor.grid,
+            target,
+            class_ids=config.class_ids,
+            occupancy_threshold=config.occupancy_threshold,
+        )
+        temporal_iou = compute_semantic_iou(
+            fused,
+            target,
+            class_ids=config.class_ids,
+            occupancy_threshold=config.occupancy_threshold,
+        )
+        baseline_vehicle, target_vehicle = _vehicle_masks(anchor.grid, target)
+        metadata = anchor.metadata or {}
+        scene_vehicle_union = int(np.count_nonzero(baseline_vehicle | target_vehicle))
+        new_vehicle_voxels = int(np.count_nonzero(target_vehicle & ~baseline_vehicle))
+        coverage = _metadata_depth_coverage(metadata, anchor.grid)
+        abs_steer = abs(_metadata_float(metadata, "steer", 0.0))
+        yaw_delta = _yaw_delta_degrees(local_frames, local_anchor)
+        nearby = _metadata_int(metadata, "nearby_vehicles_50m", 0)
+        total_vehicles = _metadata_int(metadata, "total_npc_vehicles", 0)
+        disagreement = occupancy_disagreement_rate(
+            anchor.grid,
+            fused,
+            occupancy_threshold=config.occupancy_threshold,
+        )
+        slice_names: list[str] = []
+        if (
+            scene_vehicle_union >= config.min_vehicle_union
+            and new_vehicle_voxels >= config.min_vehicle_union
+        ):
+            slice_names.append("vehicle_change")
+        if sparse_threshold is not None and coverage <= sparse_threshold:
+            slice_names.append("sparse_depth")
+        if (
+            abs_steer >= config.turn_steer_threshold
+            or yaw_delta >= config.turn_yaw_delta_threshold_degrees
+        ):
+            slice_names.append("turning")
+        if max(nearby, total_vehicles) >= config.dense_traffic_min_nearby:
+            slice_names.append("dense_traffic")
+        if disagreement > config.disagreement_threshold:
+            slice_names.append("high_disagreement")
+        if not slice_names:
+            continue
+
+        labeled_candidate_count += 1
+        candidate = _ScenarioMemoryCandidate(
+            anchor=ScenarioMemoryAnchor(
+                anchor_index=processed_count - config.future_window,
+                run_id=metadata.get("run_id"),
+                frame=metadata.get("frame"),
+                slice_names=tuple(slice_names),
+                depth_coverage=float(coverage),
+                abs_steer=float(abs_steer),
+                yaw_delta_degrees=float(yaw_delta),
+                nearby_vehicles_50m=nearby,
+                total_npc_vehicles=total_vehicles,
+                disagreement_rate=float(disagreement),
+                scene_vehicle_union=scene_vehicle_union,
+                new_vehicle_voxel_count=new_vehicle_voxels,
+            ),
+            baseline=anchor.grid,
+            temporal=temporal,
+            target=target,
+            baseline_iou=baseline_iou,
+            temporal_iou=temporal_iou,
+        )
+        for slice_name in slice_names:
+            if len(selected[slice_name]) < config.anchors_per_slice:
+                selected[slice_name].append(candidate)
+
+    return (
+        selected,
+        {
+            "candidate_count": candidate_count,
+            "labeled_candidate_count": labeled_candidate_count,
+            "sparse_depth_threshold": sparse_threshold,
+        },
+        {
+            "requested_raw_frame_count": config.max_scan_frames,
+            "processed_raw_frame_count": processed_count,
+            "skipped_frame_count": sum(second_skipped_errors.values()),
+            "skipped_errors": second_skipped_errors,
+            "skipped_examples": [example.__dict__ for example in second_skipped_examples],
+        },
+    )
+
+
 def _write_selected_anchors_jsonl(
     path: Path,
     selected_by_slice: Mapping[str, Sequence[_ScenarioMemoryCandidate]],
@@ -969,8 +1169,15 @@ def run_scenario_memory_evaluation(
     bev_dir = output_dir / "scenario_memory_bev"
     collection_summary: dict[str, Any] = {}
 
-    frame_sequence: Sequence[OccupancyFrame]
-    if frames is None:
+    selected_by_slice: dict[str, list[_ScenarioMemoryCandidate]]
+    if frames is None and raw_samples is None:
+        selected_by_slice, candidate_summary, collection_summary = (
+            _stream_scenario_memory_selection(
+                config=eval_config,
+                class_names=class_names,
+            )
+        )
+    elif frames is None:
         collection_config = FuturePseudoEvalConfig(
             dataset_name=eval_config.dataset_name,
             split=eval_config.split,
@@ -990,25 +1197,30 @@ def run_scenario_memory_evaluation(
             raw_samples=raw_samples,
             max_raw_frames=eval_config.max_scan_frames,
         )
-        frame_sequence = loaded_frames
+        candidates, candidate_summary = score_scenario_memory_candidates(
+            loaded_frames,
+            config=eval_config,
+        )
+        selected_by_slice = _select_candidates_by_slice(
+            candidates,
+            anchors_per_slice=eval_config.anchors_per_slice,
+        )
     else:
-        frame_sequence = frames
+        candidates, candidate_summary = score_scenario_memory_candidates(
+            frames,
+            config=eval_config,
+        )
+        selected_by_slice = _select_candidates_by_slice(
+            candidates,
+            anchors_per_slice=eval_config.anchors_per_slice,
+        )
         collection_summary = {
-            "requested_raw_frame_count": len(frame_sequence),
-            "processed_raw_frame_count": len(frame_sequence),
+            "requested_raw_frame_count": len(frames),
+            "processed_raw_frame_count": len(frames),
             "skipped_frame_count": 0,
             "skipped_errors": {},
             "skipped_examples": [],
         }
-
-    candidates, candidate_summary = score_scenario_memory_candidates(
-        frame_sequence,
-        config=eval_config,
-    )
-    selected_by_slice = _select_candidates_by_slice(
-        candidates,
-        anchors_per_slice=eval_config.anchors_per_slice,
-    )
 
     by_slice_payload: dict[str, Any] = {
         "evaluation_name": "scenario_memory_future_pseudo_iou",
