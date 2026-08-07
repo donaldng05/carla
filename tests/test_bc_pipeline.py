@@ -1,12 +1,15 @@
 from typing import Any
 
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
 
 from src.data.bc_sequences import BehavioralCloningSequenceDataset, collate_bc_sequences
 from src.planning.bc_evaluation import action_metrics
-from src.planning.bc_training import weighted_bc_loss
+from src.planning.bc_training import load_checkpoint, save_checkpoint, weighted_bc_loss
 from src.transforms.bc_augmentation import shift_sequence_horizontally
 
 
@@ -68,6 +71,28 @@ def test_weighted_loss_and_action_metrics_use_steer_then_throttle_order() -> Non
     result = action_metrics(prediction, target)
     assert result["steering_mae"] == pytest.approx(0.05)
     assert result["throttle_mae"] == pytest.approx(0.1)
+
+
+def test_checkpoint_round_trip_restores_model_and_optimizer(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    source = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    checkpoint = save_checkpoint(
+        tmp_path / "checkpoint.pt",
+        epoch=3,
+        model=model,
+        optimizer=optimizer,
+        scheduler=None,
+        best_val_loss=0.25,
+        config={"sequence_length": 4},
+    )
+    restored = torch.nn.Linear(3, 2)
+    restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-3)
+    state = load_checkpoint(checkpoint, model=restored, optimizer=restored_optimizer)
+    assert state["epoch"] == 3
+    assert state["best_val_loss"] == pytest.approx(0.25)
+    for name, value in restored.state_dict().items():
+        assert torch.equal(value, source[name])
 
 
 def test_model_shape_contract_if_torchvision_is_available() -> None:

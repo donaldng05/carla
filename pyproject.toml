@@ -12,6 +12,7 @@ dependencies = [
   "datasets>=2.19",
   "requests>=2.31",
   "torch>=2.4",
+  "torchvision>=0.19",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,7 @@ dev = [
   "pytest>=8.0",
   "hypothesis>=6.100",
   "types-requests>=2.31",
+  "wandb>=0.17",
 ]
 viz = [
   "matplotlib>=3.8",
