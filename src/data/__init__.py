@@ -17,6 +17,8 @@ __all__ = [
     "collate_carla_samples",
     "format_split_audit_report",
     "validate_processed_dataset",
+    "BehavioralCloningSequenceDataset",
+    "collate_bc_sequences",
 ]
 
 _SPLIT_AUDIT_EXPORTS = {
@@ -36,6 +38,8 @@ _CARLA_DATASET_EXPORTS = {
     "validate_processed_dataset",
 }
 
+_BC_SEQUENCE_EXPORTS = {"BehavioralCloningSequenceDataset", "collate_bc_sequences"}
+
 
 def __getattr__(name: str) -> Any:
     if name in _SPLIT_AUDIT_EXPORTS:
@@ -44,6 +48,10 @@ def __getattr__(name: str) -> Any:
 
     if name in _CARLA_DATASET_EXPORTS:
         module = import_module("src.data.carla_dataset")
+        return getattr(module, name)
+
+    if name in _BC_SEQUENCE_EXPORTS:
+        module = import_module("src.data.bc_sequences")
         return getattr(module, name)
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
