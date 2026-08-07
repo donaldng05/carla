@@ -14,9 +14,14 @@ from src.data.carla_dataset import CarlaDataPreprocessingConfig, CarlaMultimodal
 class BehavioralCloningSequenceDataset(Dataset[dict[str, Any]]):
     """Build past-only windows without crossing recording-run boundaries."""
 
-    def __init__(self, samples: Sequence[Mapping[str, Any]], *, sequence_length: int = 4,
-                 preprocessing: CarlaDataPreprocessingConfig | None = None,
-                 require_contiguous_frames: bool = True) -> None:
+    def __init__(
+        self,
+        samples: Sequence[Mapping[str, Any]],
+        *,
+        sequence_length: int = 4,
+        preprocessing: CarlaDataPreprocessingConfig | None = None,
+        require_contiguous_frames: bool = True,
+    ) -> None:
         if sequence_length < 1:
             raise ValueError("sequence_length must be positive")
         self.samples = samples
@@ -55,14 +60,19 @@ class BehavioralCloningSequenceDataset(Dataset[dict[str, Any]]):
         frames = [item["metadata"].get("frame") for item in items]
         timestamps = [item["metadata"].get("timestamp") for item in items]
         numeric_timestamps = [value for value in timestamps if isinstance(value, (int, float))]
-        horizon = (float(numeric_timestamps[-1] - numeric_timestamps[0])
-                   if len(numeric_timestamps) == len(timestamps) else None)
-        metadata.update({
-            "sequence_length": self.sequence_length,
-            "sequence_frames": frames,
-            "sequence_timestamps": timestamps,
-            "temporal_horizon_seconds": horizon,
-        })
+        horizon = (
+            float(numeric_timestamps[-1] - numeric_timestamps[0])
+            if len(numeric_timestamps) == len(timestamps)
+            else None
+        )
+        metadata.update(
+            {
+                "sequence_length": self.sequence_length,
+                "sequence_frames": frames,
+                "sequence_timestamps": timestamps,
+                "temporal_horizon_seconds": horizon,
+            }
+        )
         hard_control = abs(float(target[1])) >= 0.15
         return {
             "rgb": torch.stack([item["rgb"] for item in items], dim=0),

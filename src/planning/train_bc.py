@@ -51,26 +51,39 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def train_model(model: torch.nn.Module, train_loader: DataLoader[Any], val_loader: DataLoader[Any],
-                config: dict[str, Any], *, device: torch.device,
-                checkpoint_dir: str | Path) -> list[dict[str, float]]:
+def train_model(
+    model: torch.nn.Module,
+    train_loader: DataLoader[Any],
+    val_loader: DataLoader[Any],
+    config: dict[str, Any],
+    *,
+    device: torch.device,
+    checkpoint_dir: str | Path,
+) -> list[dict[str, float]]:
     """Train and checkpoint one model; datasets/loaders are injected for testability."""
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(config["learning_rate"]),
-                                  weight_decay=float(config.get("weight_decay", 0.0)))
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(config["learning_rate"]),
+        weight_decay=float(config.get("weight_decay", 0.0)),
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, int(config["num_epochs"]))
     start_epoch = 0
     best = float("inf")
     resume = config.get("resume_checkpoint")
     if resume:
-        state = load_checkpoint(resume, model=model, optimizer=optimizer, scheduler=scheduler,
-                                map_location=device)
+        state = load_checkpoint(
+            resume, model=model, optimizer=optimizer, scheduler=scheduler, map_location=device
+        )
         start_epoch = int(state["epoch"]) + 1
         best = float(state.get("best_val_loss", best))
     history: list[dict[str, float]] = []
     for epoch in range(start_epoch, int(config["num_epochs"])):
         train = run_bc_epoch(
-            model, train_loader, optimizer, device=device,
+            model,
+            train_loader,
+            optimizer,
+            device=device,
             steering_weight=float(config.get("steering_loss_weight", 2.0)),
             throttle_weight=float(config.get("throttle_loss_weight", 1.0)),
             augmentation_shift_pixels=int(config.get("augmentation_shift_pixels", 0)),
@@ -78,23 +91,41 @@ def train_model(model: torch.nn.Module, train_loader: DataLoader[Any], val_loade
         )
         with torch.no_grad():
             validation = run_bc_epoch(
-                model, val_loader, None, device=device,
+                model,
+                val_loader,
+                None,
+                device=device,
                 steering_weight=float(config.get("steering_loss_weight", 2.0)),
                 throttle_weight=float(config.get("throttle_loss_weight", 1.0)),
             )
         scheduler.step()
-        record = {"epoch": float(epoch), **{f"train_{k}": v for k, v in train.items()},
-                  **{f"val_{k}": v for k, v in validation.items()}}
+        record = {
+            "epoch": float(epoch),
+            **{f"train_{k}": v for k, v in train.items()},
+            **{f"val_{k}": v for k, v in validation.items()},
+        }
         history.append(record)
         checkpoint_path = Path(checkpoint_dir) / f"ckpt_epoch_{epoch:03d}.pt"
-        save_checkpoint(checkpoint_path, epoch=epoch, model=model, optimizer=optimizer,
-                        scheduler=scheduler, best_val_loss=min(best, validation["loss"]),
-                        config=config)
+        save_checkpoint(
+            checkpoint_path,
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            best_val_loss=min(best, validation["loss"]),
+            config=config,
+        )
         if validation["loss"] < best:
             best = validation["loss"]
-            save_checkpoint(Path(checkpoint_dir) / "best_checkpoint.pt", epoch=epoch,
-                            model=model, optimizer=optimizer, scheduler=scheduler,
-                            best_val_loss=best, config=config)
+            save_checkpoint(
+                Path(checkpoint_dir) / "best_checkpoint.pt",
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_loss=best,
+                config=config,
+            )
     return history
 
 

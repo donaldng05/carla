@@ -11,9 +11,16 @@ from torch import nn
 class BehavioralCloningModel(nn.Module):
     """Predict ``[steering, throttle]`` from four past/current RGB frames."""
 
-    def __init__(self, *, sequence_length: int = 4, transformer_heads: int = 4,
-                 transformer_layers: int = 2, dropout: float = 0.0,
-                 pretrained: bool = False, freeze_early_layers: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        sequence_length: int = 4,
+        transformer_heads: int = 4,
+        transformer_layers: int = 2,
+        dropout: float = 0.0,
+        pretrained: bool = False,
+        freeze_early_layers: bool = True,
+    ) -> None:
         super().__init__()
         if sequence_length < 1:
             raise ValueError("sequence_length must be positive")
@@ -29,8 +36,11 @@ class BehavioralCloningModel(nn.Module):
                     parameter.requires_grad = False
         self.position = nn.Parameter(torch.zeros(1, sequence_length, self.feature_dim))
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.feature_dim, nhead=transformer_heads, dropout=dropout,
-            batch_first=True, norm_first=True,
+            d_model=self.feature_dim,
+            nhead=transformer_heads,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
         )
         self.temporal_encoder = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
         self.head = nn.Sequential(nn.Linear(self.feature_dim, 128), nn.ReLU(), nn.Linear(128, 2))
@@ -51,7 +61,9 @@ class BehavioralCloningModel(nn.Module):
             raise ValueError(f"Expected (B,T,C,H,W), got {tuple(video.shape)}")
         batch, time, channels, height, width = video.shape
         if time != self.sequence_length or channels != 3:
-            raise ValueError(f"Expected time={self.sequence_length}, channels=3; got {time}, {channels}")
+            raise ValueError(
+                f"Expected time={self.sequence_length}, channels=3; got {time}, {channels}"
+            )
         features = self.backbone(video.reshape(batch * time, channels, height, width))
         features = features.reshape(batch, time, self.feature_dim)
         encoded = self.temporal_encoder(features + self.position)
