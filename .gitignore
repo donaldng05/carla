@@ -5,9 +5,15 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.codegraph/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 outputs/
+wandb/
+.wandb/
 dist/
 build/
 *.egg-info/
