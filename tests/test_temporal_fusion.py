@@ -117,3 +117,14 @@ def test_make_temporal_alignment_figure_creates_axis_without_error() -> None:
 
     assert ax.get_title() == "Temporal occupancy alignment"
     fig.clf()
+
+
+def test_fuse_occupancy_frames_with_explicit_target_pose() -> None:
+    frame1 = OccupancyFrame(grid_with_voxels([(3, 3, 1, 1)]), pose(x=0.0))
+    target_p = pose(x=1.0)
+    fused = fuse_occupancy_frames([frame1], weights=(1.0,), target_ego_pose=target_p)
+    # The voxel at (3, 3, 1) in world coords is at x=-1 in target_p frame (center translated by -1.0)
+    # voxel_indices_to_points with mins=(-3, -3, 0), size=1.0: index (3, 3, 1) has point center (0.5, 0.5, 1.5).
+    # In target frame with x=1.0, x becomes -0.5, which falls into index 2.
+    assert fused.occupancy_score[2, 3, 1] == 1.0
+    assert fused.semantic[2, 3, 1] == 1
