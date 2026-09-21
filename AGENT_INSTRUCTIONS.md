@@ -4,9 +4,9 @@
 
 This repository contains a CARLA-based autonomous driving perception project governed by three source-of-truth documents:
 
-1. `docs/carla_project_docs_v1.jsx`
-2. `docs/carla_plan_v4.jsx`
-3. `docs/AI_COLLABORATION_PROTOCOL.jsx`
+1. `docs/carla_project_docs_v1.md`
+2. `docs/carla_plan_v4.md`
+3. `docs/AI_COLLABORATION_PROTOCOL.md`
 
 Any coding agent working in this repository must read and obey those three documents before making changes.
 
@@ -20,7 +20,7 @@ Always interpret project decisions using this order of precedence:
 
 ### Tier 1 — Hard Constraints
 
-`docs/carla_project_docs_v1.jsx`
+`docs/carla_project_docs_v1.md`
 
 * These are non-negotiable rules.
 * Never silently violate them.
@@ -28,7 +28,7 @@ Always interpret project decisions using this order of precedence:
 
 ### Tier 2 — Current Project Intent
 
-`docs/carla_plan_v4.jsx`
+`docs/carla_plan_v4.md`
 
 * This defines the current architecture, current phase ordering, milestone structure, and implementation priorities.
 * Follow it unless reality makes it impossible.
@@ -36,7 +36,7 @@ Always interpret project decisions using this order of precedence:
 
 ### Tier 3 — Collaboration Procedure
 
-`docs/AI_COLLABORATION_PROTOCOL.jsx`
+`docs/AI_COLLABORATION_PROTOCOL.md`
 
 * This defines how to interpret ambiguity, when to implement directly, and when to escalate.
 * Use it to decide whether something is:
@@ -53,9 +53,9 @@ Before writing or editing code, always do the following:
 
 1. Read:
 
-   * `docs/carla_project_docs_v1.jsx`
-   * `docs/carla_plan_v4.jsx`
-   * `docs/AI_COLLABORATION_PROTOCOL.jsx`
+   * `docs/carla_project_docs_v1.md`
+   * `docs/carla_plan_v4.md`
+   * `docs/AI_COLLABORATION_PROTOCOL.md`
    * `CURRENT_STATE.md` if it exists
 
 2. Output a short **Governance Check** before coding.
@@ -90,7 +90,7 @@ If a request conflicts with the Constitution:
 
 ### 2. Never silently drift from the Plan
 
-If the requested task conflicts with `docs/carla_plan_v4.jsx`:
+If the requested task conflicts with `docs/carla_plan_v4.md`:
 
 * identify the exact contradiction,
 * explain whether it is a small implementation adaptation or a real plan deviation,
