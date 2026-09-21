@@ -89,8 +89,9 @@ def fuse_occupancy_frames(
     frames_newest_first: Sequence[OccupancyFrame],
     *,
     weights: Iterable[float] = DEFAULT_FUSION_WEIGHTS,
+    target_ego_pose: np.ndarray | list[list[float]] | None = None,
 ) -> FusedOccupancyGrid:
-    """Fuse occupancy frames into the newest frame using weighted binary occupancy evidence."""
+    """Fuse occupancy frames into a target ego frame using weighted binary occupancy evidence."""
 
     frames = list(frames_newest_first)
     if not frames:
@@ -114,6 +115,12 @@ def fuse_occupancy_frames(
     if total_weight <= 0.0:
         raise ValueError("at least one fusion weight must be positive")
 
+    target_pose = (
+        current.ego_pose
+        if target_ego_pose is None
+        else _validate_pose(target_ego_pose, "target_ego_pose")
+    )
+
     for frame, weight in zip(frames, used_weights):
         if frame.grid.spec != spec:
             raise ValueError("all occupancy frames must use the same grid spec")
@@ -123,7 +130,7 @@ def fuse_occupancy_frames(
         indices, labels, counts = transform_grid_to_ego_frame(
             frame.grid,
             source_ego_pose=frame.ego_pose,
-            target_ego_pose=current.ego_pose,
+            target_ego_pose=target_pose,
         )
         if indices.size == 0:
             continue

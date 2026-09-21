@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from collections import deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -38,7 +37,6 @@ from src.perception.temporal_fusion import (
     OccupancyFrame,
     TemporalFusionBuffer,
     fuse_occupancy_frames,
-    transform_grid_to_ego_frame,
 )
 from src.transforms import carla_pose_to_matrix
 
@@ -71,6 +69,21 @@ BEV_CLASS_COLORS = {
 }
 
 
+def _validate_config(
+    cfg: Any,
+    positive: Sequence[str] = (),
+    non_negative: Sequence[str] = (),
+) -> None:
+    for name in positive:
+        if getattr(cfg, name) < 1:
+            raise ValueError(f"{name} must be at least 1")
+    for name in non_negative:
+        if getattr(cfg, name) < 0:
+            raise ValueError(f"{name} must be non-negative")
+    if cfg.class_names is None:
+        object.__setattr__(cfg, "class_names", CARLA_CLASS_NAMES)
+
+
 @dataclass(frozen=True)
 class Phase2CarlaEvalConfig:
     """Configuration for a bounded streamed CARLA occupancy evaluation."""
@@ -88,12 +101,7 @@ class Phase2CarlaEvalConfig:
     class_names: Mapping[int, str] | None = None
 
     def __post_init__(self) -> None:
-        if self.max_frames < 1:
-            raise ValueError("max_frames must be at least 1")
-        if self.bev_frame_count < 0:
-            raise ValueError("bev_frame_count must be non-negative")
-        if self.class_names is None:
-            object.__setattr__(self, "class_names", CARLA_CLASS_NAMES)
+        _validate_config(self, positive=("max_frames",), non_negative=("bev_frame_count",))
 
 
 @dataclass(frozen=True)
@@ -145,24 +153,15 @@ class FuturePseudoEvalConfig:
     class_names: Mapping[int, str] | None = None
 
     def __post_init__(self) -> None:
-        if self.anchor_count < 1:
-            raise ValueError("anchor_count must be at least 1")
-        if self.past_window < 1:
-            raise ValueError("past_window must be at least 1")
-        if self.future_window < 1:
-            raise ValueError("future_window must be at least 1")
-        if self.bev_frame_count < 0:
-            raise ValueError("bev_frame_count must be non-negative")
-        if self.alignment_frame_count < 0:
-            raise ValueError("alignment_frame_count must be non-negative")
-        if self.alignment_tolerance_voxels < 0:
-            raise ValueError("alignment_tolerance_voxels must be non-negative")
+        _validate_config(
+            self,
+            positive=("anchor_count", "past_window", "future_window"),
+            non_negative=("bev_frame_count", "alignment_frame_count", "alignment_tolerance_voxels"),
+        )
         if not self.thresholds:
             raise ValueError("thresholds must contain at least one value")
         if not self.fusion_profiles:
             raise ValueError("fusion_profiles must contain at least one profile")
-        if self.class_names is None:
-            object.__setattr__(self, "class_names", CARLA_CLASS_NAMES)
 
 
 @dataclass(frozen=True)
@@ -191,12 +190,7 @@ SCENARIO_MEMORY_SLICE_NAMES = (
 
 @dataclass(frozen=True)
 class ScenarioMemoryEvalConfig:
-    """Configuration for heuristic, non-exclusive scenario-memory evaluation slices.
-
-    Slice selection is scene-derived from occupancy grids and frame metadata. The
-    reported IoU rows still follow ``class_ids`` so callers can restrict metrics
-    without changing which scene anchors are eligible for scenario slices.
-    """
+    """Configuration for heuristic, non-exclusive scenario-memory evaluation slices."""
 
     dataset_name: str = DEFAULT_DATASET_NAME
     split: str = "validation"
@@ -220,24 +214,21 @@ class ScenarioMemoryEvalConfig:
     class_names: Mapping[int, str] | None = None
 
     def __post_init__(self) -> None:
-        if self.max_scan_frames < 1:
-            raise ValueError("max_scan_frames must be at least 1")
-        if self.anchors_per_slice < 1:
-            raise ValueError("anchors_per_slice must be at least 1")
-        if self.min_vehicle_union < 1:
-            raise ValueError("min_vehicle_union must be at least 1")
+        _validate_config(
+            self,
+            positive=(
+                "max_scan_frames",
+                "anchors_per_slice",
+                "min_vehicle_union",
+                "past_window",
+                "future_window",
+            ),
+            non_negative=("bev_frame_count_per_slice",),
+        )
         if not 0.0 <= self.sparse_depth_quantile <= 1.0:
             raise ValueError("sparse_depth_quantile must be between 0 and 1")
-        if self.bev_frame_count_per_slice < 0:
-            raise ValueError("bev_frame_count_per_slice must be non-negative")
-        if self.past_window < 1:
-            raise ValueError("past_window must be at least 1")
-        if self.future_window < 1:
-            raise ValueError("future_window must be at least 1")
         if not self.fusion_weights:
             raise ValueError("fusion_weights must contain at least one weight")
-        if self.class_names is None:
-            object.__setattr__(self, "class_names", CARLA_CLASS_NAMES)
 
 
 @dataclass(frozen=True)
@@ -306,22 +297,58 @@ class FrameSkipExample:
     message: str
 
 
+class _ErrorTracker:
+    """Tracks frame processing skip errors and examples across evaluation loops."""
+
+    def __init__(self) -> None:
+        self.errors: dict[str, int] = {}
+        self.examples: list[FrameSkipExample] = []
+
+    def record(self, exc: Exception, idx: int, sample: Mapping[str, Any] | None) -> None:
+        name = type(exc).__name__
+        self.errors[name] = self.errors.get(name, 0) + 1
+        if len(self.examples) < 5:
+            self.examples.append(
+                FrameSkipExample(
+                    frame_index=idx,
+                    run_id=None if sample is None else sample.get("run_id"),
+                    frame=None if sample is None else sample.get("frame"),
+                    error_type=name,
+                    message=str(exc),
+                )
+            )
+
+    def summary(self, requested: int, processed: int) -> dict[str, Any]:
+        return {
+            "requested_raw_frame_count": requested,
+            "processed_raw_frame_count": processed,
+            "skipped_frame_count": sum(self.errors.values()),
+            "skipped_errors": self.errors,
+            "skipped_examples": [ex.__dict__ for ex in self.examples],
+        }
+
+    def raise_if_empty(self, processed: int) -> None:
+        if processed == 0:
+            details = "; ".join(
+                f"{e.error_type} at index {e.frame_index} (run_id={e.run_id}, frame={e.frame}): {e.message}"
+                for e in self.examples
+            )
+            raise RuntimeError(
+                f"No frames were processed successfully; cannot write IoU summaries. "
+                f"Skipped errors: {self.errors}. Examples: {details}"
+            )
+
+
 def stream_huggingface_samples(dataset_name: str, split: str) -> Iterable[Mapping[str, Any]]:
     """Stream raw dataset samples from Hugging Face."""
-
     from datasets import load_dataset
 
-    # The dataset's Parquet row groups are large enough that the default
-    # row-group-sized streaming batches can exhaust notebook memory before the
-    # first sample is yielded. Keep the Arrow record batches small so bounded
-    # evaluators remain genuinely bounded in memory.
     dataset = load_dataset(dataset_name, split=split, streaming=True, batch_size=1)
     return iter(dataset)
 
 
 def ego_pose_from_sample(sample: Mapping[str, Any]) -> np.ndarray:
     """Build a vehicle-to-world ego pose matrix from one CARLA sample."""
-
     return carla_pose_to_matrix(
         x=float(sample.get("location_x", 0.0) or 0.0),
         y=float(sample.get("location_y", 0.0) or 0.0),
@@ -339,42 +366,36 @@ def fused_to_semantic_grid(
     occupancy_threshold: float,
 ) -> SemanticOccupancyGrid:
     """Convert a fused occupancy score grid to a semantic grid for visualization."""
-
     occupied = fused.occupancy_score >= occupancy_threshold
     semantic = np.where(occupied, fused.semantic, UNKNOWN_CLASS).astype(np.int16)
-    counts = occupied.astype(np.uint16)
-    return SemanticOccupancyGrid(fused.spec, occupied, semantic, counts)
+    return SemanticOccupancyGrid(fused.spec, occupied, semantic, occupied.astype(np.uint16))
 
 
-def _processed_sample_from_raw(
+def _frame_from_sample(
     sample: Mapping[str, Any],
     *,
     preprocessing: CarlaDataPreprocessingConfig,
-) -> tuple[dict[str, Any], np.ndarray]:
-    dataset = CarlaMultimodalDataset([sample], preprocessing=preprocessing)
-    return dataset[0], dataset.extrinsics
-
-
-def _grid_from_processed_sample(
-    processed: Mapping[str, Any],
-    *,
-    extrinsics: np.ndarray,
-    fov_degrees: float,
     spec: OccupancyGridSpec,
-) -> SemanticOccupancyGrid:
+    raw_index: int | None = None,
+) -> OccupancyFrame:
+    """Build an OccupancyFrame from a raw dataset sample."""
+    dataset = CarlaMultimodalDataset([sample], preprocessing=preprocessing)
+    processed, extrinsics = dataset[0], dataset.extrinsics
     rgb = processed["rgb"]
-    depth = processed["depth"].detach().cpu().numpy()
-    segmentation = processed["segmentation"].detach().cpu().numpy()
-    height = int(rgb.shape[1])
-    width = int(rgb.shape[2])
-    intrinsics = estimate_front_camera_intrinsics(width, height, fov_degrees)
-    return build_semantic_occupancy_grid(
-        depth,
-        segmentation,
+    intrinsics = estimate_front_camera_intrinsics(
+        int(rgb.shape[2]), int(rgb.shape[1]), preprocessing.fov_degrees
+    )
+    grid = build_semantic_occupancy_grid(
+        processed["depth"].detach().cpu().numpy(),
+        processed["segmentation"].detach().cpu().numpy(),
         intrinsics,
         extrinsics,
         spec=spec,
     )
+    metadata = dict(processed["metadata"])
+    if raw_index is not None:
+        metadata["index"] = raw_index
+    return OccupancyFrame(grid, ego_pose_from_sample(sample), metadata=metadata)
 
 
 def _topdown_semantic_image(grid: SemanticOccupancyGrid) -> np.ndarray:
@@ -387,23 +408,22 @@ def _topdown_semantic_image(grid: SemanticOccupancyGrid) -> np.ndarray:
     return image.T
 
 
-def _crop_panels_to_occupied(
-    panels: list[np.ndarray],
-    *,
-    padding: int = 8,
-) -> list[np.ndarray]:
+def _crop_panels_to_occupied(panels: list[np.ndarray], *, padding: int = 8) -> list[np.ndarray]:
     occupied = np.zeros(panels[0].shape, dtype=bool)
     for panel in panels:
         occupied |= panel != UNKNOWN_CLASS
     rows, cols = np.nonzero(occupied)
     if rows.size == 0:
         return panels
-
-    row_start = max(int(rows.min()) - padding, 0)
-    row_end = min(int(rows.max()) + padding + 1, panels[0].shape[0])
-    col_start = max(int(cols.min()) - padding, 0)
-    col_end = min(int(cols.max()) + padding + 1, panels[0].shape[1])
-    return [panel[row_start:row_end, col_start:col_end] for panel in panels]
+    r0, r1 = (
+        max(int(rows.min()) - padding, 0),
+        min(int(rows.max()) + padding + 1, panels[0].shape[0]),
+    )
+    c0, c1 = (
+        max(int(cols.min()) - padding, 0),
+        min(int(cols.max()) + padding + 1, panels[0].shape[1]),
+    )
+    return [panel[r0:r1, c0:c1] for panel in panels]
 
 
 def save_bev_comparison(
@@ -417,7 +437,6 @@ def save_bev_comparison(
     panel_titles: tuple[str, str, str] = ("Baseline", "Temporal fusion", "Target proxy"),
 ) -> Path:
     """Save baseline, temporal, and target-proxy BEV grids side by side."""
-
     try:
         import matplotlib
 
@@ -425,39 +444,36 @@ def save_bev_comparison(
         import matplotlib.colors as mcolors
         import matplotlib.patches as mpatches
         import matplotlib.pyplot as plt
-    except ImportError as exc:  # pragma: no cover - optional visualization dependency
+    except ImportError as exc:
         raise ImportError("matplotlib is required for BEV comparison output") from exc
 
-    panel_arrays = [
-        _topdown_semantic_image(baseline),
-        _topdown_semantic_image(temporal),
-        _topdown_semantic_image(target),
-    ]
-    panel_arrays = _crop_panels_to_occupied(panel_arrays)
+    panel_arrays = _crop_panels_to_occupied(
+        [
+            _topdown_semantic_image(baseline),
+            _topdown_semantic_image(temporal),
+            _topdown_semantic_image(target),
+        ]
+    )
     colors = BEV_CLASS_COLORS
     display_names = BEV_CLASS_NAMES | dict(class_names)
-    observed_classes = {int(value) for panel in panel_arrays for value in np.unique(panel)}
+    observed_classes = {int(v) for p in panel_arrays for v in np.unique(p)}
     classes = sorted(set(colors) | set(class_names) | observed_classes)
-    class_to_index = {class_id: index for index, class_id in enumerate(classes)}
-    cmap = mcolors.ListedColormap([colors.get(class_id, "#4c78a8") for class_id in classes])
-    panels = list(zip(panel_titles, panel_arrays))
+    class_to_index = {cls: i for i, cls in enumerate(classes)}
+    cmap = mcolors.ListedColormap([colors.get(c, "#4c78a8") for c in classes])
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
-    for ax, (panel_title, panel) in zip(axes, panels):
+    for ax, (panel_title, panel) in zip(axes, zip(panel_titles, panel_arrays)):
         indexed = np.vectorize(class_to_index.__getitem__)(panel)
         ax.imshow(indexed, origin="lower", cmap=cmap, interpolation="nearest")
         ax.set_title(panel_title)
         ax.axis("off")
 
     handles = [
-        mpatches.Patch(
-            color=colors.get(class_id, "#4c78a8"),
-            label=display_names.get(class_id, f"class {class_id}"),
-        )
-        for class_id in classes
-        if class_id != UNKNOWN_CLASS
+        mpatches.Patch(color=colors.get(c, "#4c78a8"), label=display_names.get(c, f"class {c}"))
+        for c in classes
+        if c != UNKNOWN_CLASS
     ]
     fig.suptitle(title)
     fig.legend(handles=handles, loc="lower center", ncol=max(1, len(handles)))
@@ -466,61 +482,42 @@ def save_bev_comparison(
     return path
 
 
+def _try_save_bev(
+    *,
+    baseline: SemanticOccupancyGrid,
+    temporal: SemanticOccupancyGrid,
+    target: SemanticOccupancyGrid,
+    output_path: Path,
+    title: str,
+    class_names: Mapping[int, str],
+    panel_titles: tuple[str, str, str] = ("Baseline", "Temporal fusion", "Target proxy"),
+    error_tracker: dict[str, int],
+    images: list[Path] | None = None,
+) -> Path | None:
+    """Save BEV comparison and record any visualization errors safely."""
+    try:
+        path = save_bev_comparison(
+            baseline=baseline,
+            temporal=temporal,
+            target=target,
+            output_path=output_path,
+            title=title,
+            class_names=class_names,
+            panel_titles=panel_titles,
+        )
+        if images is not None:
+            images.append(path)
+        return path
+    except Exception as exc:
+        err_name = type(exc).__name__
+        error_tracker[err_name] = error_tracker.get(err_name, 0) + 1
+        return None
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
-
-
-def _semantic_grid_from_transformed_frames(
-    frames: Sequence[OccupancyFrame],
-    *,
-    target_ego_pose: np.ndarray,
-    spec: OccupancyGridSpec,
-) -> SemanticOccupancyGrid:
-    occupied = np.zeros(spec.shape, dtype=bool)
-    count_accumulator = np.zeros(spec.shape, dtype=np.uint32)
-    semantic = np.full(spec.shape, UNKNOWN_CLASS, dtype=np.int16)
-    semantic_votes: dict[tuple[int, int], float] = {}
-
-    for frame in frames:
-        if frame.grid.spec != spec:
-            raise ValueError("all occupancy frames must use the same grid spec")
-
-        indices, labels, counts = transform_grid_to_ego_frame(
-            frame.grid,
-            source_ego_pose=frame.ego_pose,
-            target_ego_pose=target_ego_pose,
-        )
-        if indices.size == 0:
-            continue
-
-        linear = np.ravel_multi_index((indices[:, 0], indices[:, 1], indices[:, 2]), spec.shape)
-        unique_linear, inverse = np.unique(linear, return_inverse=True)
-        occupied.flat[unique_linear] = True
-        count_accumulator.flat[unique_linear] += np.bincount(
-            inverse,
-            weights=np.maximum(counts, 1.0),
-            minlength=unique_linear.size,
-        ).astype(np.uint32)
-
-        for linear_index, label, count in zip(linear, labels, counts):
-            semantic_votes[(int(linear_index), int(label))] = semantic_votes.get(
-                (int(linear_index), int(label)),
-                0.0,
-            ) + max(float(count), 1.0)
-
-    best_vote_by_voxel: dict[int, tuple[float, int]] = {}
-    for (linear_index, label), vote in semantic_votes.items():
-        best_vote, best_label = best_vote_by_voxel.get(linear_index, (-1.0, UNKNOWN_CLASS))
-        if vote > best_vote or (np.isclose(vote, best_vote) and label < best_label):
-            best_vote_by_voxel[linear_index] = (vote, label)
-
-    for linear_index, (_, label) in best_vote_by_voxel.items():
-        semantic.flat[linear_index] = label
-
-    clipped_counts = np.clip(count_accumulator, 0, np.iinfo(np.uint16).max).astype(np.uint16)
-    return SemanticOccupancyGrid(spec, occupied, semantic, clipped_counts)
 
 
 def union_grids_in_ego_frame(
@@ -530,12 +527,19 @@ def union_grids_in_ego_frame(
     spec: OccupancyGridSpec,
 ) -> SemanticOccupancyGrid:
     """Union occupancy frames into a target ego frame using the transform stack."""
-
-    return _semantic_grid_from_transformed_frames(
+    if not frames:
+        return SemanticOccupancyGrid(
+            spec,
+            np.zeros(spec.shape, dtype=bool),
+            np.full(spec.shape, UNKNOWN_CLASS, dtype=np.int16),
+            np.zeros(spec.shape, dtype=np.uint16),
+        )
+    fused = fuse_occupancy_frames(
         frames,
+        weights=[1.0] * len(frames),
         target_ego_pose=target_ego_pose,
-        spec=spec,
     )
+    return fused_to_semantic_grid(fused, occupancy_threshold=1e-6)
 
 
 def _occupied_overlap_ratio(first: SemanticOccupancyGrid, second: SemanticOccupancyGrid) -> float:
@@ -543,8 +547,7 @@ def _occupied_overlap_ratio(first: SemanticOccupancyGrid, second: SemanticOccupa
     union_count = int(np.count_nonzero(union))
     if union_count == 0:
         return 1.0
-    intersection = first.occupied & second.occupied
-    return float(np.count_nonzero(intersection) / union_count)
+    return float(np.count_nonzero(first.occupied & second.occupied) / union_count)
 
 
 def _dilate_occupied(occupied: np.ndarray, *, tolerance_voxels: int) -> np.ndarray:
@@ -557,25 +560,11 @@ def _dilate_occupied(occupied: np.ndarray, *, tolerance_voxels: int) -> np.ndarr
         for dy in range(-tolerance_voxels, tolerance_voxels + 1):
             if dx * dx + dy * dy > tolerance_voxels * tolerance_voxels:
                 continue
-
-            source_x_start = max(0, -dx)
-            source_x_end = min(x_size, x_size - dx)
-            source_y_start = max(0, -dy)
-            source_y_end = min(y_size, y_size - dy)
-            target_x_start = max(0, dx)
-            target_x_end = min(x_size, x_size + dx)
-            target_y_start = max(0, dy)
-            target_y_end = min(y_size, y_size + dy)
-
-            dilated[
-                target_x_start:target_x_end,
-                target_y_start:target_y_end,
-                :z_size,
-            ] |= occupied[
-                source_x_start:source_x_end,
-                source_y_start:source_y_end,
-                :z_size,
-            ]
+            sx0, sx1 = max(0, -dx), min(x_size, x_size - dx)
+            sy0, sy1 = max(0, -dy), min(y_size, y_size - dy)
+            tx0, tx1 = max(0, dx), min(x_size, x_size + dx)
+            ty0, ty1 = max(0, dy), min(y_size, y_size + dy)
+            dilated[tx0:tx1, ty0:ty1, :z_size] |= occupied[sx0:sx1, sy0:sy1, :z_size]
     return dilated
 
 
@@ -589,17 +578,9 @@ def _occupied_near_overlap_ratio(
     union_count = int(np.count_nonzero(union))
     if union_count == 0:
         return 1.0
-
-    first_near_second = first.occupied & _dilate_occupied(
-        second.occupied,
-        tolerance_voxels=tolerance_voxels,
-    )
-    second_near_first = second.occupied & _dilate_occupied(
-        first.occupied,
-        tolerance_voxels=tolerance_voxels,
-    )
-    near_overlap = first_near_second | second_near_first
-    return float(np.count_nonzero(near_overlap) / union_count)
+    f_near_s = first.occupied & _dilate_occupied(second.occupied, tolerance_voxels=tolerance_voxels)
+    s_near_f = second.occupied & _dilate_occupied(first.occupied, tolerance_voxels=tolerance_voxels)
+    return float(np.count_nonzero(f_near_s | s_near_f) / union_count)
 
 
 def _anchor_indices(
@@ -623,7 +604,6 @@ def _all_context_valid_anchor_indices(
     future_window: int,
 ) -> tuple[int, ...]:
     """Return every anchor with enough past and future context in the scanned buffer."""
-
     return _anchor_indices(
         frame_count=frame_count,
         anchor_count=frame_count,
@@ -634,109 +614,77 @@ def _all_context_valid_anchor_indices(
 
 def _collect_occupancy_frames(
     *,
-    config: FuturePseudoEvalConfig,
+    config: Any,
     raw_samples: Iterable[Mapping[str, Any]] | None,
     max_raw_frames: int | None = None,
 ) -> tuple[list[OccupancyFrame], dict[str, Any]]:
     preprocessing = config.preprocessing or build_occupancy_preprocessing_config()
     spec = config.grid_spec or OccupancyGridSpec()
-    samples = raw_samples
-    if samples is None:
-        samples = stream_huggingface_samples(config.dataset_name, config.split)
-
-    requested_frames = (
+    samples = (
+        raw_samples
+        if raw_samples is not None
+        else stream_huggingface_samples(config.dataset_name, config.split)
+    )
+    requested = (
         max_raw_frames
         if max_raw_frames is not None
         else config.anchor_count + config.past_window - 1 + config.future_window
     )
     frames: list[OccupancyFrame] = []
-    skipped_errors: dict[str, int] = {}
-    skipped_examples: list[FrameSkipExample] = []
+    tracker = _ErrorTracker()
 
-    for raw_index, sample in enumerate(islice(samples, requested_frames)):
+    for raw_idx, sample in enumerate(islice(samples, requested)):
         try:
-            processed, extrinsics = _processed_sample_from_raw(sample, preprocessing=preprocessing)
-            grid = _grid_from_processed_sample(
-                processed,
-                extrinsics=extrinsics,
-                fov_degrees=preprocessing.fov_degrees,
-                spec=spec,
-            )
-            metadata = dict(processed["metadata"])
-            metadata["index"] = raw_index
-            frames.append(OccupancyFrame(grid, ego_pose_from_sample(sample), metadata=metadata))
-        except Exception as exc:
-            error_name = type(exc).__name__
-            skipped_errors[error_name] = skipped_errors.get(error_name, 0) + 1
-            if len(skipped_examples) < 5:
-                skipped_examples.append(
-                    FrameSkipExample(
-                        frame_index=raw_index,
-                        run_id=None if sample is None else sample.get("run_id"),
-                        frame=None if sample is None else sample.get("frame"),
-                        error_type=error_name,
-                        message=str(exc),
-                    )
+            frames.append(
+                _frame_from_sample(
+                    sample, preprocessing=preprocessing, spec=spec, raw_index=raw_idx
                 )
+            )
+        except Exception as exc:
+            tracker.record(exc, raw_idx, sample)
 
-    summary = {
-        "requested_raw_frame_count": requested_frames,
-        "processed_raw_frame_count": len(frames),
-        "skipped_frame_count": sum(skipped_errors.values()),
-        "skipped_errors": skipped_errors,
-        "skipped_examples": [example.__dict__ for example in skipped_examples],
-    }
-    return frames, summary
+    return frames, tracker.summary(requested, len(frames))
 
 
 def _class_row(summary: Mapping[int, ClassIoU], class_id: int) -> dict[str, Any]:
-    value = summary[class_id]
-    return {
-        "iou": value.iou,
-        "intersection": value.intersection,
-        "union": value.union,
-    }
+    v = summary[class_id]
+    return {"iou": v.iou, "intersection": v.intersection, "union": v.union}
 
 
 def _ablation_row_score(row: Mapping[str, Any]) -> tuple[float, float]:
-    vehicle = row["classes"].get("10", {})
-    road = row["classes"].get("7", {})
-    vehicle_score = -1.0 if int(vehicle.get("union", 0)) == 0 else float(vehicle.get("iou", 0.0))
-    road_score = -1.0 if int(road.get("union", 0)) == 0 else float(road.get("iou", 0.0))
-    return vehicle_score, road_score
+    veh, road = row["classes"].get("10", {}), row["classes"].get("7", {})
+    return (
+        -1.0 if int(veh.get("union", 0)) == 0 else float(veh.get("iou", 0.0)),
+        -1.0 if int(road.get("union", 0)) == 0 else float(road.get("iou", 0.0)),
+    )
 
 
-def _metadata_float(metadata: Mapping[str, Any] | None, key: str, default: float = 0.0) -> float:
-    if metadata is None:
-        return default
-    value = metadata.get(key, default)
+def _meta_float(metadata: Mapping[str, Any] | None, key: str, default: float = 0.0) -> float:
     try:
-        return float(value)
+        val = (metadata or {}).get(key)
+        return float(val) if val is not None else default
     except (TypeError, ValueError):
         return default
 
 
-def _metadata_int(metadata: Mapping[str, Any] | None, key: str, default: int = 0) -> int:
-    if metadata is None:
-        return default
-    value = metadata.get(key, default)
+def _meta_int(metadata: Mapping[str, Any] | None, key: str, default: int = 0) -> int:
     try:
-        return int(value)
+        val = (metadata or {}).get(key)
+        return int(val) if val is not None else default
     except (TypeError, ValueError):
         return default
 
 
 def _metadata_depth_coverage(
-    metadata: Mapping[str, Any] | None,
-    grid: SemanticOccupancyGrid,
+    metadata: Mapping[str, Any] | None, grid: SemanticOccupancyGrid
 ) -> float:
     if metadata is not None:
         depth_summary = metadata.get("depth_summary")
         if isinstance(depth_summary, Mapping):
-            for key in ("coverage", "valid_fraction", "valid_ratio", "observed_fraction"):
-                if key in depth_summary:
+            for k in ("coverage", "valid_fraction", "valid_ratio", "observed_fraction"):
+                if k in depth_summary:
                     try:
-                        return float(depth_summary[key])
+                        return float(depth_summary[k])
                     except (TypeError, ValueError):
                         break
     return float(np.count_nonzero(grid.occupied) / grid.occupied.size)
@@ -745,21 +693,9 @@ def _metadata_depth_coverage(
 def _yaw_delta_degrees(frames: Sequence[OccupancyFrame], anchor_index: int) -> float:
     if anchor_index <= 0:
         return 0.0
-    current = frames[anchor_index].metadata or {}
-    previous = frames[anchor_index - 1].metadata or {}
-    current_yaw = _metadata_float(current, "rotation_yaw", 0.0)
-    previous_yaw = _metadata_float(previous, "rotation_yaw", current_yaw)
-    delta = (current_yaw - previous_yaw + 180.0) % 360.0 - 180.0
-    return abs(float(delta))
-
-
-def _vehicle_masks(
-    baseline: SemanticOccupancyGrid,
-    target: SemanticOccupancyGrid,
-) -> tuple[np.ndarray, np.ndarray]:
-    baseline_vehicle = baseline.occupied & (baseline.semantic == VEHICLE_CLASS_ID)
-    target_vehicle = target.occupied & (target.semantic == VEHICLE_CLASS_ID)
-    return baseline_vehicle, target_vehicle
+    curr_yaw = _meta_float(frames[anchor_index].metadata, "rotation_yaw", 0.0)
+    prev_yaw = _meta_float(frames[anchor_index - 1].metadata, "rotation_yaw", curr_yaw)
+    return abs(float((curr_yaw - prev_yaw + 180.0) % 360.0 - 180.0))
 
 
 def _scenario_iou_payload(
@@ -768,26 +704,105 @@ def _scenario_iou_payload(
     *,
     class_names: Mapping[int, str],
 ) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    for class_id in sorted(baseline_summary):
-        baseline = baseline_summary[class_id]
-        temporal = temporal_summary[class_id]
-        informative = baseline.union > 0 or temporal.union > 0
-        rows.append(
+    return {
+        "classes": [
             {
-                "class_id": class_id,
-                "class_name": class_names.get(class_id, str(class_id)),
-                "baseline_iou": baseline.iou,
-                "temporal_iou": temporal.iou,
-                "delta": temporal.iou - baseline.iou,
-                "baseline_intersection": baseline.intersection,
-                "baseline_union": baseline.union,
-                "temporal_intersection": temporal.intersection,
-                "temporal_union": temporal.union,
-                "informative": informative,
+                "class_id": cid,
+                "class_name": class_names.get(cid, str(cid)),
+                "baseline_iou": b.iou,
+                "temporal_iou": t.iou,
+                "delta": t.iou - b.iou,
+                "baseline_intersection": b.intersection,
+                "baseline_union": b.union,
+                "temporal_intersection": t.intersection,
+                "temporal_union": t.union,
+                "informative": b.union > 0 or t.union > 0,
             }
-        )
-    return {"classes": rows}
+            for cid in sorted(baseline_summary)
+            for b, t in [(baseline_summary[cid], temporal_summary[cid])]
+        ]
+    }
+
+
+def _evaluate_anchor_candidate(
+    *,
+    frames: Sequence[OccupancyFrame],
+    anchor_idx: int,
+    past_window: int,
+    future_window: int,
+    spec: OccupancyGridSpec,
+    fusion_weights: Sequence[float],
+    occupancy_threshold: float,
+    class_ids: Sequence[int],
+    sparse_threshold: float | None,
+    config: ScenarioMemoryEvalConfig,
+) -> _ScenarioMemoryCandidate | None:
+    """Evaluate one anchor frame for scenario slice inclusion and IoU."""
+    anchor = frames[anchor_idx]
+    past_frames = frames[anchor_idx - past_window + 1 : anchor_idx + 1]
+    future_frames = frames[anchor_idx : anchor_idx + future_window]
+
+    target = union_grids_in_ego_frame(future_frames, target_ego_pose=anchor.ego_pose, spec=spec)
+    fused = fuse_occupancy_frames(tuple(reversed(past_frames)), weights=fusion_weights)
+    temporal = fused_to_semantic_grid(fused, occupancy_threshold=occupancy_threshold)
+
+    b_veh = anchor.grid.occupied & (anchor.grid.semantic == VEHICLE_CLASS_ID)
+    t_veh = target.occupied & (target.semantic == VEHICLE_CLASS_ID)
+    scene_veh_union = int(np.count_nonzero(b_veh | t_veh))
+    new_veh_voxels = int(np.count_nonzero(t_veh & ~b_veh))
+    meta = anchor.metadata or {}
+    coverage = _metadata_depth_coverage(meta, anchor.grid)
+    abs_steer = abs(_meta_float(meta, "steer", 0.0))
+    yaw_delta = _yaw_delta_degrees(frames, anchor_idx)
+    nearby = _meta_int(meta, "nearby_vehicles_50m", 0)
+    tot_veh = _meta_int(meta, "total_npc_vehicles", 0)
+    disagreement = occupancy_disagreement_rate(
+        anchor.grid, fused, occupancy_threshold=occupancy_threshold
+    )
+
+    slice_names: list[str] = []
+    if scene_veh_union >= config.min_vehicle_union and new_veh_voxels >= config.min_vehicle_union:
+        slice_names.append("vehicle_change")
+    if sparse_threshold is not None and coverage <= sparse_threshold:
+        slice_names.append("sparse_depth")
+    if (
+        abs_steer >= config.turn_steer_threshold
+        or yaw_delta >= config.turn_yaw_delta_threshold_degrees
+    ):
+        slice_names.append("turning")
+    if max(nearby, tot_veh) >= config.dense_traffic_min_nearby:
+        slice_names.append("dense_traffic")
+    if disagreement > config.disagreement_threshold:
+        slice_names.append("high_disagreement")
+
+    if not slice_names:
+        return None
+
+    return _ScenarioMemoryCandidate(
+        anchor=ScenarioMemoryAnchor(
+            anchor_index=anchor_idx,
+            run_id=meta.get("run_id"),
+            frame=meta.get("frame"),
+            slice_names=tuple(slice_names),
+            depth_coverage=float(coverage),
+            abs_steer=float(abs_steer),
+            yaw_delta_degrees=float(yaw_delta),
+            nearby_vehicles_50m=nearby,
+            total_npc_vehicles=tot_veh,
+            disagreement_rate=float(disagreement),
+            scene_vehicle_union=scene_veh_union,
+            new_vehicle_voxel_count=new_veh_voxels,
+        ),
+        baseline=anchor.grid,
+        temporal=temporal,
+        target=target,
+        baseline_iou=compute_semantic_iou(
+            anchor.grid, target, class_ids=class_ids, occupancy_threshold=occupancy_threshold
+        ),
+        temporal_iou=compute_semantic_iou(
+            fused, target, class_ids=class_ids, occupancy_threshold=occupancy_threshold
+        ),
+    )
 
 
 def score_scenario_memory_candidates(
@@ -796,138 +811,41 @@ def score_scenario_memory_candidates(
     config: ScenarioMemoryEvalConfig | None = None,
 ) -> tuple[list[_ScenarioMemoryCandidate], dict[str, Any]]:
     """Score all context-valid anchors and assign heuristic scenario labels."""
-
-    eval_config = config or ScenarioMemoryEvalConfig()
+    cfg = config or ScenarioMemoryEvalConfig()
     if not frames:
         return [], {"candidate_count": 0, "sparse_depth_threshold": None}
 
-    spec = eval_config.grid_spec or frames[0].grid.spec
+    spec = cfg.grid_spec or frames[0].grid.spec
     anchors = _all_context_valid_anchor_indices(
-        frame_count=len(frames),
-        past_window=eval_config.past_window,
-        future_window=eval_config.future_window,
+        frame_count=len(frames), past_window=cfg.past_window, future_window=cfg.future_window
     )
     if not anchors:
         return [], {"candidate_count": 0, "sparse_depth_threshold": None}
 
-    candidate_inputs: list[dict[str, Any]] = []
-    for anchor_index in anchors:
-        anchor = frames[anchor_index]
-        past_frames = frames[anchor_index - eval_config.past_window + 1 : anchor_index + 1]
-        future_frames = frames[anchor_index : anchor_index + eval_config.future_window]
-        target = union_grids_in_ego_frame(
-            future_frames,
-            target_ego_pose=anchor.ego_pose,
-            spec=spec,
-        )
-        fused = fuse_occupancy_frames(
-            tuple(reversed(past_frames)), weights=eval_config.fusion_weights
-        )
-        temporal = fused_to_semantic_grid(
-            fused,
-            occupancy_threshold=eval_config.occupancy_threshold,
-        )
-        baseline_iou = compute_semantic_iou(
-            anchor.grid,
-            target,
-            class_ids=eval_config.class_ids,
-            occupancy_threshold=eval_config.occupancy_threshold,
-        )
-        temporal_iou = compute_semantic_iou(
-            fused,
-            target,
-            class_ids=eval_config.class_ids,
-            occupancy_threshold=eval_config.occupancy_threshold,
-        )
-        baseline_vehicle, target_vehicle = _vehicle_masks(anchor.grid, target)
-        scene_vehicle_union = int(np.count_nonzero(baseline_vehicle | target_vehicle))
-        new_vehicle_voxels = int(np.count_nonzero(target_vehicle & ~baseline_vehicle))
-        metadata = anchor.metadata or {}
-        coverage = _metadata_depth_coverage(metadata, anchor.grid)
-        candidate_inputs.append(
-            {
-                "anchor_index": anchor_index,
-                "baseline": anchor.grid,
-                "temporal": temporal,
-                "target": target,
-                "baseline_iou": baseline_iou,
-                "temporal_iou": temporal_iou,
-                "depth_coverage": coverage,
-                "scene_vehicle_union": scene_vehicle_union,
-                "new_vehicle_voxels": new_vehicle_voxels,
-                "abs_steer": abs(_metadata_float(metadata, "steer", 0.0)),
-                "yaw_delta_degrees": _yaw_delta_degrees(frames, anchor_index),
-                "nearby_vehicles_50m": _metadata_int(metadata, "nearby_vehicles_50m", 0),
-                "total_npc_vehicles": _metadata_int(metadata, "total_npc_vehicles", 0),
-                "disagreement_rate": occupancy_disagreement_rate(
-                    anchor.grid,
-                    fused,
-                    occupancy_threshold=eval_config.occupancy_threshold,
-                ),
-                "metadata": metadata,
-            }
-        )
+    coverages = [_metadata_depth_coverage(frames[i].metadata, frames[i].grid) for i in anchors]
+    sparse_thresh = float(np.quantile(coverages, cfg.sparse_depth_quantile)) if coverages else None
 
-    sparse_threshold = float(
-        np.quantile(
-            [candidate["depth_coverage"] for candidate in candidate_inputs],
-            eval_config.sparse_depth_quantile,
-        )
-    )
     candidates: list[_ScenarioMemoryCandidate] = []
-    for candidate in candidate_inputs:
-        slice_names: list[str] = []
-        if (
-            candidate["scene_vehicle_union"] >= eval_config.min_vehicle_union
-            and candidate["new_vehicle_voxels"] >= eval_config.min_vehicle_union
-        ):
-            slice_names.append("vehicle_change")
-        if candidate["depth_coverage"] <= sparse_threshold:
-            slice_names.append("sparse_depth")
-        if (
-            candidate["abs_steer"] >= eval_config.turn_steer_threshold
-            or candidate["yaw_delta_degrees"] >= eval_config.turn_yaw_delta_threshold_degrees
-        ):
-            slice_names.append("turning")
-        if (
-            candidate["nearby_vehicles_50m"] >= eval_config.dense_traffic_min_nearby
-            or candidate["total_npc_vehicles"] >= eval_config.dense_traffic_min_nearby
-        ):
-            slice_names.append("dense_traffic")
-        if candidate["disagreement_rate"] > eval_config.disagreement_threshold:
-            slice_names.append("high_disagreement")
-        if not slice_names:
-            continue
-
-        metadata = candidate["metadata"]
-        candidates.append(
-            _ScenarioMemoryCandidate(
-                anchor=ScenarioMemoryAnchor(
-                    anchor_index=int(candidate["anchor_index"]),
-                    run_id=metadata.get("run_id"),
-                    frame=metadata.get("frame"),
-                    slice_names=tuple(slice_names),
-                    depth_coverage=float(candidate["depth_coverage"]),
-                    abs_steer=float(candidate["abs_steer"]),
-                    yaw_delta_degrees=float(candidate["yaw_delta_degrees"]),
-                    nearby_vehicles_50m=int(candidate["nearby_vehicles_50m"]),
-                    total_npc_vehicles=int(candidate["total_npc_vehicles"]),
-                    disagreement_rate=float(candidate["disagreement_rate"]),
-                    scene_vehicle_union=int(candidate["scene_vehicle_union"]),
-                    new_vehicle_voxel_count=int(candidate["new_vehicle_voxels"]),
-                ),
-                baseline=candidate["baseline"],
-                temporal=candidate["temporal"],
-                target=candidate["target"],
-                baseline_iou=candidate["baseline_iou"],
-                temporal_iou=candidate["temporal_iou"],
-            )
+    for a_idx in anchors:
+        candidate = _evaluate_anchor_candidate(
+            frames=frames,
+            anchor_idx=a_idx,
+            past_window=cfg.past_window,
+            future_window=cfg.future_window,
+            spec=spec,
+            fusion_weights=cfg.fusion_weights,
+            occupancy_threshold=cfg.occupancy_threshold,
+            class_ids=cfg.class_ids,
+            sparse_threshold=sparse_thresh,
+            config=cfg,
         )
+        if candidate is not None:
+            candidates.append(candidate)
 
     return candidates, {
-        "candidate_count": len(candidate_inputs),
+        "candidate_count": len(anchors),
         "labeled_candidate_count": len(candidates),
-        "sparse_depth_threshold": sparse_threshold,
+        "sparse_depth_threshold": sparse_thresh,
     }
 
 
@@ -937,208 +855,13 @@ def _select_candidates_by_slice(
     anchors_per_slice: int,
 ) -> dict[str, list[_ScenarioMemoryCandidate]]:
     selected: dict[str, list[_ScenarioMemoryCandidate]] = {
-        slice_name: [] for slice_name in SCENARIO_MEMORY_SLICE_NAMES
+        s: [] for s in SCENARIO_MEMORY_SLICE_NAMES
     }
-    for candidate in candidates:
-        for slice_name in candidate.anchor.slice_names:
-            if len(selected[slice_name]) < anchors_per_slice:
-                selected[slice_name].append(candidate)
+    for c in candidates:
+        for s in c.anchor.slice_names:
+            if len(selected[s]) < anchors_per_slice:
+                selected[s].append(c)
     return selected
-
-
-def _stream_scenario_memory_selection(
-    *,
-    config: ScenarioMemoryEvalConfig,
-    class_names: Mapping[int, str],
-) -> tuple[dict[str, list[_ScenarioMemoryCandidate]], dict[str, Any], dict[str, Any]]:
-    """Select scenario anchors with a rolling window instead of storing all grids."""
-
-    preprocessing = config.preprocessing or build_occupancy_preprocessing_config()
-    coverages: list[float] = []
-    skipped_errors: dict[str, int] = {}
-    skipped_examples: list[FrameSkipExample] = []
-
-    # A first lightweight pass obtains the global sparse-depth threshold. Only
-    # scalar coverage values are retained from this pass.
-    for raw_index, sample in enumerate(
-        islice(
-            stream_huggingface_samples(config.dataset_name, config.split), config.max_scan_frames
-        )
-    ):
-        try:
-            processed, _ = _processed_sample_from_raw(sample, preprocessing=preprocessing)
-            depth_summary = processed["metadata"].get("depth_summary", {})
-            coverages.append(float(depth_summary.get("coverage", 0.0)))
-        except Exception as exc:
-            error_name = type(exc).__name__
-            skipped_errors[error_name] = skipped_errors.get(error_name, 0) + 1
-            if len(skipped_examples) < 5:
-                skipped_examples.append(
-                    FrameSkipExample(
-                        frame_index=raw_index,
-                        run_id=sample.get("run_id"),
-                        frame=sample.get("frame"),
-                        error_type=error_name,
-                        message=str(exc),
-                    )
-                )
-
-    sparse_threshold = (
-        float(np.quantile(coverages, config.sparse_depth_quantile)) if coverages else None
-    )
-    selected: dict[str, list[_ScenarioMemoryCandidate]] = {
-        slice_name: [] for slice_name in SCENARIO_MEMORY_SLICE_NAMES
-    }
-    context_window = config.past_window + config.future_window - 1
-    window: deque[OccupancyFrame] = deque(maxlen=context_window)
-    processed_count = 0
-    candidate_count = 0
-    labeled_candidate_count = 0
-    second_skipped_errors: dict[str, int] = {}
-    second_skipped_examples: list[FrameSkipExample] = []
-
-    # Re-open the stream and retain only enough frames for one context-valid
-    # anchor. At most past_window + future_window grids live at once.
-    for raw_index, sample in enumerate(
-        islice(
-            stream_huggingface_samples(config.dataset_name, config.split), config.max_scan_frames
-        )
-    ):
-        try:
-            processed, extrinsics = _processed_sample_from_raw(sample, preprocessing=preprocessing)
-            grid = _grid_from_processed_sample(
-                processed,
-                extrinsics=extrinsics,
-                fov_degrees=preprocessing.fov_degrees,
-                spec=config.grid_spec or OccupancyGridSpec(),
-            )
-            window.append(
-                OccupancyFrame(
-                    grid,
-                    ego_pose_from_sample(sample),
-                    metadata=dict(processed["metadata"]),
-                )
-            )
-            processed_count += 1
-        except Exception as exc:
-            error_name = type(exc).__name__
-            second_skipped_errors[error_name] = second_skipped_errors.get(error_name, 0) + 1
-            if len(second_skipped_examples) < 5:
-                second_skipped_examples.append(
-                    FrameSkipExample(
-                        frame_index=raw_index,
-                        run_id=sample.get("run_id"),
-                        frame=sample.get("frame"),
-                        error_type=error_name,
-                        message=str(exc),
-                    )
-                )
-            continue
-
-        if len(window) < context_window:
-            continue
-
-        candidate_count += 1
-        local_frames = tuple(window)
-        local_anchor = config.past_window - 1
-        anchor = local_frames[local_anchor]
-        past_frames = local_frames[: config.past_window]
-        future_frames = local_frames[local_anchor:]
-        spec = config.grid_spec or anchor.grid.spec
-        target = union_grids_in_ego_frame(
-            future_frames,
-            target_ego_pose=anchor.ego_pose,
-            spec=spec,
-        )
-        fused = fuse_occupancy_frames(tuple(reversed(past_frames)), weights=config.fusion_weights)
-        temporal = fused_to_semantic_grid(fused, occupancy_threshold=config.occupancy_threshold)
-        baseline_iou = compute_semantic_iou(
-            anchor.grid,
-            target,
-            class_ids=config.class_ids,
-            occupancy_threshold=config.occupancy_threshold,
-        )
-        temporal_iou = compute_semantic_iou(
-            fused,
-            target,
-            class_ids=config.class_ids,
-            occupancy_threshold=config.occupancy_threshold,
-        )
-        baseline_vehicle, target_vehicle = _vehicle_masks(anchor.grid, target)
-        metadata = anchor.metadata or {}
-        scene_vehicle_union = int(np.count_nonzero(baseline_vehicle | target_vehicle))
-        new_vehicle_voxels = int(np.count_nonzero(target_vehicle & ~baseline_vehicle))
-        coverage = _metadata_depth_coverage(metadata, anchor.grid)
-        abs_steer = abs(_metadata_float(metadata, "steer", 0.0))
-        yaw_delta = _yaw_delta_degrees(local_frames, local_anchor)
-        nearby = _metadata_int(metadata, "nearby_vehicles_50m", 0)
-        total_vehicles = _metadata_int(metadata, "total_npc_vehicles", 0)
-        disagreement = occupancy_disagreement_rate(
-            anchor.grid,
-            fused,
-            occupancy_threshold=config.occupancy_threshold,
-        )
-        slice_names: list[str] = []
-        if (
-            scene_vehicle_union >= config.min_vehicle_union
-            and new_vehicle_voxels >= config.min_vehicle_union
-        ):
-            slice_names.append("vehicle_change")
-        if sparse_threshold is not None and coverage <= sparse_threshold:
-            slice_names.append("sparse_depth")
-        if (
-            abs_steer >= config.turn_steer_threshold
-            or yaw_delta >= config.turn_yaw_delta_threshold_degrees
-        ):
-            slice_names.append("turning")
-        if max(nearby, total_vehicles) >= config.dense_traffic_min_nearby:
-            slice_names.append("dense_traffic")
-        if disagreement > config.disagreement_threshold:
-            slice_names.append("high_disagreement")
-        if not slice_names:
-            continue
-
-        labeled_candidate_count += 1
-        candidate = _ScenarioMemoryCandidate(
-            anchor=ScenarioMemoryAnchor(
-                anchor_index=processed_count - config.future_window,
-                run_id=metadata.get("run_id"),
-                frame=metadata.get("frame"),
-                slice_names=tuple(slice_names),
-                depth_coverage=float(coverage),
-                abs_steer=float(abs_steer),
-                yaw_delta_degrees=float(yaw_delta),
-                nearby_vehicles_50m=nearby,
-                total_npc_vehicles=total_vehicles,
-                disagreement_rate=float(disagreement),
-                scene_vehicle_union=scene_vehicle_union,
-                new_vehicle_voxel_count=new_vehicle_voxels,
-            ),
-            baseline=anchor.grid,
-            temporal=temporal,
-            target=target,
-            baseline_iou=baseline_iou,
-            temporal_iou=temporal_iou,
-        )
-        for slice_name in slice_names:
-            if len(selected[slice_name]) < config.anchors_per_slice:
-                selected[slice_name].append(candidate)
-
-    return (
-        selected,
-        {
-            "candidate_count": candidate_count,
-            "labeled_candidate_count": labeled_candidate_count,
-            "sparse_depth_threshold": sparse_threshold,
-        },
-        {
-            "requested_raw_frame_count": config.max_scan_frames,
-            "processed_raw_frame_count": processed_count,
-            "skipped_frame_count": sum(second_skipped_errors.values()),
-            "skipped_errors": second_skipped_errors,
-            "skipped_examples": [example.__dict__ for example in second_skipped_examples],
-        },
-    )
 
 
 def _write_selected_anchors_jsonl(
@@ -1148,11 +871,56 @@ def _write_selected_anchors_jsonl(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for slice_name, candidates in selected_by_slice.items():
-            for candidate in candidates:
-                handle.write(
-                    json.dumps(candidate.anchor.to_json_record(slice_name=slice_name)) + "\n"
-                )
+            for c in candidates:
+                handle.write(json.dumps(c.anchor.to_json_record(slice_name=slice_name)) + "\n")
     return path
+
+
+def _write_standard_artifacts(
+    output_dir: Path,
+    prefix: str,
+    baseline_summary: Mapping[int, ClassIoU],
+    temporal_summary: Mapping[int, ClassIoU],
+    evaluator: ShadowModeEvaluator,
+    class_names: Mapping[int, str],
+) -> tuple[Path, Path, Path, Path]:
+    """Write standard baseline/temporal IoU summaries and shadow mode records/clusters."""
+    return (
+        write_iou_summary_json(
+            baseline_summary,
+            output_dir / f"{prefix}_baseline_iou_summary.json",
+            class_names=class_names,
+        ),
+        write_iou_summary_json(
+            temporal_summary,
+            output_dir / f"{prefix}_temporal_iou_summary.json",
+            class_names=class_names,
+        ),
+        evaluator.write_records_jsonl(output_dir / f"{prefix}_shadow_records.jsonl"),
+        evaluator.write_cluster_summary_json(output_dir / f"{prefix}_shadow_clusters.json"),
+    )
+
+
+def _base_eval_summary(
+    eval_name: str,
+    cfg: Any,
+    class_names: Mapping[int, str],
+    bev_images: Sequence[Path],
+    vis_errors: Mapping[str, int],
+    **extra: Any,
+) -> dict[str, Any]:
+    """Construct a shared evaluation summary payload."""
+    return {
+        "evaluation_name": eval_name,
+        "dataset_name": cfg.dataset_name,
+        "split": cfg.split,
+        "occupancy_threshold": cfg.occupancy_threshold,
+        "disagreement_threshold": cfg.disagreement_threshold,
+        "class_ids": {str(cid): class_names.get(cid, str(cid)) for cid in cfg.class_ids},
+        "visualization_errors": dict(vis_errors),
+        "bev_images": [str(p) for p in bev_images],
+        **extra,
+    }
 
 
 def run_scenario_memory_evaluation(
@@ -1162,65 +930,23 @@ def run_scenario_memory_evaluation(
     frames: Sequence[OccupancyFrame] | None = None,
 ) -> ScenarioMemoryEvalArtifacts:
     """Evaluate future-pseudo IoU on anchors where temporal memory should matter."""
+    cfg = config or ScenarioMemoryEvalConfig()
+    class_names = cfg.class_names or CARLA_CLASS_NAMES
+    out_dir = Path(cfg.output_dir)
+    bev_dir = out_dir / "scenario_memory_bev"
+    col_summary: dict[str, Any] = {}
 
-    eval_config = config or ScenarioMemoryEvalConfig()
-    class_names = eval_config.class_names or CARLA_CLASS_NAMES
-    output_dir = Path(eval_config.output_dir)
-    bev_dir = output_dir / "scenario_memory_bev"
-    collection_summary: dict[str, Any] = {}
-
-    selected_by_slice: dict[str, list[_ScenarioMemoryCandidate]]
-    if frames is None and raw_samples is None:
-        selected_by_slice, candidate_summary, collection_summary = (
-            _stream_scenario_memory_selection(
-                config=eval_config,
-                class_names=class_names,
-            )
-        )
-    elif frames is None:
-        collection_config = FuturePseudoEvalConfig(
-            dataset_name=eval_config.dataset_name,
-            split=eval_config.split,
-            anchor_count=eval_config.max_scan_frames,
-            output_dir=eval_config.output_dir,
-            occupancy_threshold=eval_config.occupancy_threshold,
-            disagreement_threshold=eval_config.disagreement_threshold,
-            past_window=eval_config.past_window,
-            future_window=eval_config.future_window,
-            preprocessing=eval_config.preprocessing,
-            grid_spec=eval_config.grid_spec,
-            class_ids=eval_config.class_ids,
-            class_names=class_names,
-        )
-        loaded_frames, collection_summary = _collect_occupancy_frames(
-            config=collection_config,
-            raw_samples=raw_samples,
-            max_raw_frames=eval_config.max_scan_frames,
-        )
-        candidates, candidate_summary = score_scenario_memory_candidates(
-            loaded_frames,
-            config=eval_config,
-        )
-        selected_by_slice = _select_candidates_by_slice(
-            candidates,
-            anchors_per_slice=eval_config.anchors_per_slice,
+    if frames is None:
+        frames, col_summary = _collect_occupancy_frames(
+            config=cfg, raw_samples=raw_samples, max_raw_frames=cfg.max_scan_frames
         )
     else:
-        candidates, candidate_summary = score_scenario_memory_candidates(
-            frames,
-            config=eval_config,
-        )
-        selected_by_slice = _select_candidates_by_slice(
-            candidates,
-            anchors_per_slice=eval_config.anchors_per_slice,
-        )
-        collection_summary = {
-            "requested_raw_frame_count": len(frames),
-            "processed_raw_frame_count": len(frames),
-            "skipped_frame_count": 0,
-            "skipped_errors": {},
-            "skipped_examples": [],
-        }
+        col_summary = _ErrorTracker().summary(len(frames), len(frames))
+
+    candidates, cand_summary = score_scenario_memory_candidates(frames, config=cfg)
+    selected_by_slice = _select_candidates_by_slice(
+        candidates, anchors_per_slice=cfg.anchors_per_slice
+    )
 
     by_slice_payload: dict[str, Any] = {
         "evaluation_name": "scenario_memory_future_pseudo_iou",
@@ -1228,88 +954,65 @@ def run_scenario_memory_evaluation(
             "future union of projected-depth semantic occupancy grids transformed into "
             "the anchor ego frame; not dense simulator 3D ground truth"
         ),
-        "class_ids": {
-            str(class_id): class_names.get(class_id, str(class_id))
-            for class_id in eval_config.class_ids
-        },
+        "class_ids": {str(cid): class_names.get(cid, str(cid)) for cid in cfg.class_ids},
         "slices": {},
     }
     bev_images: list[Path] = []
-    visualization_errors: dict[str, int] = {}
+    vis_errors: dict[str, int] = {}
 
-    for slice_name, selected in selected_by_slice.items():
-        baseline_results = [candidate.baseline_iou for candidate in selected]
-        temporal_results = [candidate.temporal_iou for candidate in selected]
-        baseline_summary = summarize_iou(baseline_results)
-        temporal_summary = summarize_iou(temporal_results)
-        by_slice_payload["slices"][slice_name] = {
+    for s_name, selected in selected_by_slice.items():
+        by_slice_payload["slices"][s_name] = {
             "selected_anchor_count": len(selected),
             **_scenario_iou_payload(
-                baseline_summary,
-                temporal_summary,
+                summarize_iou([c.baseline_iou for c in selected]),
+                summarize_iou([c.temporal_iou for c in selected]),
                 class_names=class_names,
             ),
         }
-
-        saved_for_slice = 0
-        for candidate in selected:
-            if saved_for_slice >= eval_config.bev_frame_count_per_slice:
-                break
-            frame_label = candidate.anchor.frame or candidate.anchor.anchor_index
-            try:
-                bev_images.append(
-                    save_bev_comparison(
-                        baseline=candidate.baseline,
-                        temporal=candidate.temporal,
-                        target=candidate.target,
-                        output_path=bev_dir
-                        / slice_name
-                        / f"{slice_name}_{candidate.anchor.anchor_index:05d}_{frame_label}.png",
-                        title=f"{slice_name}: frame {frame_label} future pseudo-label occupancy",
-                        class_names=class_names,
-                        panel_titles=("Baseline t", "Past temporal fusion", "Future pseudo-label"),
-                    )
-                )
-                saved_for_slice += 1
-            except Exception as exc:
-                error_name = type(exc).__name__
-                visualization_errors[error_name] = visualization_errors.get(error_name, 0) + 1
+        for c in selected[: cfg.bev_frame_count_per_slice]:
+            lbl = c.anchor.frame or c.anchor.anchor_index
+            _try_save_bev(
+                baseline=c.baseline,
+                temporal=c.temporal,
+                target=c.target,
+                output_path=bev_dir / s_name / f"{s_name}_{c.anchor.anchor_index:05d}_{lbl}.png",
+                title=f"{s_name}: frame {lbl} future pseudo-label occupancy",
+                class_names=class_names,
+                panel_titles=("Baseline t", "Past temporal fusion", "Future pseudo-label"),
+                error_tracker=vis_errors,
+                images=bev_images,
+            )
 
     selected_path = _write_selected_anchors_jsonl(
-        output_dir / "scenario_memory_selected_anchors.jsonl",
-        selected_by_slice,
+        out_dir / "scenario_memory_selected_anchors.jsonl", selected_by_slice
     )
-    by_slice_path = _write_json(output_dir / "scenario_memory_by_slice_iou.json", by_slice_payload)
+    by_slice_path = _write_json(out_dir / "scenario_memory_by_slice_iou.json", by_slice_payload)
     summary_path = _write_json(
-        output_dir / "scenario_memory_eval_summary.json",
-        {
-            "evaluation_name": "scenario_memory_future_pseudo_iou",
-            "dataset_name": eval_config.dataset_name,
-            "split": eval_config.split,
-            "max_scan_frames": eval_config.max_scan_frames,
-            "anchors_per_slice": eval_config.anchors_per_slice,
-            "past_window": eval_config.past_window,
-            "future_window": eval_config.future_window,
-            "occupancy_threshold": eval_config.occupancy_threshold,
-            "disagreement_threshold": eval_config.disagreement_threshold,
-            "fusion_weights": list(eval_config.fusion_weights),
-            "slice_names": list(SCENARIO_MEMORY_SLICE_NAMES),
-            "selected_anchor_counts": {
-                slice_name: len(selected) for slice_name, selected in selected_by_slice.items()
+        out_dir / "scenario_memory_eval_summary.json",
+        _base_eval_summary(
+            "scenario_memory_future_pseudo_iou",
+            cfg,
+            class_names,
+            bev_images,
+            vis_errors,
+            max_scan_frames=cfg.max_scan_frames,
+            anchors_per_slice=cfg.anchors_per_slice,
+            past_window=cfg.past_window,
+            future_window=cfg.future_window,
+            fusion_weights=list(cfg.fusion_weights),
+            slice_names=list(SCENARIO_MEMORY_SLICE_NAMES),
+            selected_anchor_counts={s: len(sel) for s, sel in selected_by_slice.items()},
+            selection_thresholds={
+                "min_scene_vehicle_union": cfg.min_vehicle_union,
+                "sparse_depth_quantile": cfg.sparse_depth_quantile,
+                "sparse_depth_threshold": cand_summary["sparse_depth_threshold"],
+                "turn_steer_threshold": cfg.turn_steer_threshold,
+                "turn_yaw_delta_threshold_degrees": cfg.turn_yaw_delta_threshold_degrees,
+                "dense_traffic_min_nearby": cfg.dense_traffic_min_nearby,
             },
-            "selection_thresholds": {
-                "min_scene_vehicle_union": eval_config.min_vehicle_union,
-                "sparse_depth_quantile": eval_config.sparse_depth_quantile,
-                "sparse_depth_threshold": candidate_summary["sparse_depth_threshold"],
-                "turn_steer_threshold": eval_config.turn_steer_threshold,
-                "turn_yaw_delta_threshold_degrees": eval_config.turn_yaw_delta_threshold_degrees,
-                "dense_traffic_min_nearby": eval_config.dense_traffic_min_nearby,
-            },
-            "visualization_errors": visualization_errors,
-            "bev_images": [str(path) for path in bev_images],
-            **candidate_summary,
-            **collection_summary,
-        },
+            **cand_summary,
+            **col_summary,
+        ),
     )
 
     return ScenarioMemoryEvalArtifacts(
@@ -1326,32 +1029,29 @@ def run_future_pseudo_label_evaluation(
     raw_samples: Iterable[Mapping[str, Any]] | None = None,
 ) -> FuturePseudoEvalArtifacts:
     """Evaluate baseline and temporal fusion against a future multi-frame pseudo-label."""
+    cfg = config or FuturePseudoEvalConfig()
+    spec = cfg.grid_spec or OccupancyGridSpec()
+    class_names = cfg.class_names or CARLA_CLASS_NAMES
+    out_dir = Path(cfg.output_dir)
+    bev_dir = out_dir / "future_pseudo_bev"
+    align_dir = out_dir / "alignment"
 
-    eval_config = config or FuturePseudoEvalConfig()
-    spec = eval_config.grid_spec or OccupancyGridSpec()
-    class_names = eval_config.class_names or CARLA_CLASS_NAMES
-    output_dir = Path(eval_config.output_dir)
-    bev_dir = output_dir / "future_pseudo_bev"
-    alignment_dir = output_dir / "alignment"
-
-    frames, collection_summary = _collect_occupancy_frames(
-        config=eval_config, raw_samples=raw_samples
-    )
+    frames, col_summary = _collect_occupancy_frames(config=cfg, raw_samples=raw_samples)
     anchors = _anchor_indices(
         frame_count=len(frames),
-        anchor_count=eval_config.anchor_count,
-        past_window=eval_config.past_window,
-        future_window=eval_config.future_window,
+        anchor_count=cfg.anchor_count,
+        past_window=cfg.past_window,
+        future_window=cfg.future_window,
     )
     if not anchors:
         _write_json(
-            output_dir / "future_pseudo_eval_summary.json",
+            out_dir / "future_pseudo_eval_summary.json",
             {
                 "evaluation_name": "future_pseudo_label_semantic_occupancy_iou",
                 "anchor_count": 0,
-                "skipped_anchor_count": max(eval_config.anchor_count, 1),
+                "skipped_anchor_count": max(cfg.anchor_count, 1),
                 "reason": "insufficient processed context for requested past/future windows",
-                **collection_summary,
+                **col_summary,
             },
         )
         raise RuntimeError("No anchors had enough past and future context for future-pseudo IoU")
@@ -1359,269 +1059,214 @@ def run_future_pseudo_label_evaluation(
     target_by_anchor: dict[int, SemanticOccupancyGrid] = {}
     baseline_iou_results: list[Mapping[int, ClassIoU]] = []
     ablation_iou_results: dict[tuple[str, float], list[Mapping[int, ClassIoU]]] = {
-        (profile.name, threshold): []
-        for profile in eval_config.fusion_profiles
-        for threshold in eval_config.thresholds
+        (p.name, th): [] for p in cfg.fusion_profiles for th in cfg.thresholds
     }
-    shadow_evaluator = ShadowModeEvaluator(
-        disagreement_threshold=eval_config.disagreement_threshold,
-        occupancy_threshold=eval_config.occupancy_threshold,
-        class_ids=eval_config.class_ids,
+    shadow_eval = ShadowModeEvaluator(
+        disagreement_threshold=cfg.disagreement_threshold,
+        occupancy_threshold=cfg.occupancy_threshold,
+        class_ids=cfg.class_ids,
         class_names=class_names,
     )
 
-    default_profile = eval_config.fusion_profiles[0]
     bev_images: list[Path] = []
-    alignment_images: list[Path] = []
-    alignment_records: list[dict[str, Any]] = []
-    visualization_errors: dict[str, int] = {}
+    align_images: list[Path] = []
+    align_records: list[dict[str, Any]] = []
+    vis_errors: dict[str, int] = {}
 
-    for anchor_position, anchor_index in enumerate(anchors):
-        anchor = frames[anchor_index]
-        past_frames = frames[anchor_index - eval_config.past_window + 1 : anchor_index + 1]
-        past_frames_newest_first = tuple(reversed(past_frames))
-        future_frames = frames[anchor_index : anchor_index + eval_config.future_window]
+    for pos, a_idx in enumerate(anchors):
+        anchor = frames[a_idx]
+        past_rev = tuple(reversed(frames[a_idx - cfg.past_window + 1 : a_idx + 1]))
         target = union_grids_in_ego_frame(
-            future_frames,
-            target_ego_pose=anchor.ego_pose,
-            spec=spec,
+            frames[a_idx : a_idx + cfg.future_window], target_ego_pose=anchor.ego_pose, spec=spec
         )
-        target_by_anchor[anchor_index] = target
-
+        target_by_anchor[a_idx] = target
         baseline_iou_results.append(
-            compute_semantic_iou(anchor.grid, target, class_ids=eval_config.class_ids)
+            compute_semantic_iou(anchor.grid, target, class_ids=cfg.class_ids)
         )
 
-        for profile in eval_config.fusion_profiles:
-            fused = fuse_occupancy_frames(past_frames_newest_first, weights=profile.weights)
-            for threshold in eval_config.thresholds:
-                ablation_iou_results[(profile.name, threshold)].append(
+        for prof in cfg.fusion_profiles:
+            fused = fuse_occupancy_frames(past_rev, weights=prof.weights)
+            for th in cfg.thresholds:
+                ablation_iou_results[(prof.name, th)].append(
                     compute_semantic_iou(
-                        fused,
-                        target,
-                        class_ids=eval_config.class_ids,
-                        occupancy_threshold=threshold,
+                        fused, target, class_ids=cfg.class_ids, occupancy_threshold=th
                     )
                 )
 
-        default_fused = fuse_occupancy_frames(
-            past_frames_newest_first,
-            weights=default_profile.weights,
-        )
-        shadow_evaluator.evaluate_frame(
-            baseline=anchor.grid,
-            improved=default_fused,
-            metadata=anchor.metadata or {},
+        default_fused: FusedOccupancyGrid | None = None
+        for prof in cfg.fusion_profiles:
+            fused = fuse_occupancy_frames(past_rev, weights=prof.weights)
+            if default_fused is None:
+                default_fused = fused
+            for th in cfg.thresholds:
+                ablation_iou_results[(prof.name, th)].append(
+                    compute_semantic_iou(
+                        fused, target, class_ids=cfg.class_ids, occupancy_threshold=th
+                    )
+                )
+
+        assert default_fused is not None
+        shadow_eval.evaluate_frame(
+            baseline=anchor.grid, improved=default_fused, metadata=anchor.metadata or {}
         )
 
-        if len(bev_images) < eval_config.bev_frame_count:
+        if len(bev_images) < cfg.bev_frame_count:
             temporal = fused_to_semantic_grid(
-                default_fused,
-                occupancy_threshold=eval_config.occupancy_threshold,
+                default_fused, occupancy_threshold=cfg.occupancy_threshold
             )
-            frame_label = (anchor.metadata or {}).get("frame", anchor_index)
-            try:
-                bev_images.append(
-                    save_bev_comparison(
-                        baseline=anchor.grid,
-                        temporal=temporal,
-                        target=target,
-                        output_path=bev_dir
-                        / f"future_pseudo_bev_{anchor_position:05d}_{frame_label}.png",
-                        title=f"Frame {frame_label} future pseudo-label occupancy",
-                        class_names=class_names,
-                        panel_titles=("Baseline t", "Past temporal fusion", "Future pseudo-label"),
-                    )
-                )
-            except Exception as exc:
-                error_name = type(exc).__name__
-                visualization_errors[error_name] = visualization_errors.get(error_name, 0) + 1
+            lbl = (anchor.metadata or {}).get("frame", a_idx)
+            _try_save_bev(
+                baseline=anchor.grid,
+                temporal=temporal,
+                target=target,
+                output_path=bev_dir / f"future_pseudo_bev_{pos:05d}_{lbl}.png",
+                title=f"Frame {lbl} future pseudo-label occupancy",
+                class_names=class_names,
+                panel_titles=("Baseline t", "Past temporal fusion", "Future pseudo-label"),
+                error_tracker=vis_errors,
+                images=bev_images,
+            )
 
-        if len(alignment_images) < eval_config.alignment_frame_count and anchor_index > 0:
-            previous_aligned = union_grids_in_ego_frame(
-                (frames[anchor_index - 1],),
-                target_ego_pose=anchor.ego_pose,
-                spec=spec,
+        if len(align_images) < cfg.alignment_frame_count and a_idx > 0:
+            prev_aligned = union_grids_in_ego_frame(
+                (frames[a_idx - 1],), target_ego_pose=anchor.ego_pose, spec=spec
             )
-            previous_overlap = _occupied_overlap_ratio(anchor.grid, previous_aligned)
-            future_overlap = _occupied_overlap_ratio(anchor.grid, target)
-            previous_near_overlap = _occupied_near_overlap_ratio(
-                anchor.grid,
-                previous_aligned,
-                tolerance_voxels=eval_config.alignment_tolerance_voxels,
+            lbl = (anchor.metadata or {}).get("frame", a_idx)
+            img = _try_save_bev(
+                baseline=anchor.grid,
+                temporal=prev_aligned,
+                target=target,
+                output_path=align_dir / f"alignment_frame_{pos:05d}_{lbl}.png",
+                title=f"Frame {lbl} temporal alignment diagnostic",
+                class_names=class_names,
+                panel_titles=("Current t", "Previous aligned to t", "Future target in t"),
+                error_tracker=vis_errors,
+                images=align_images,
             )
-            future_near_overlap = _occupied_near_overlap_ratio(
-                anchor.grid,
-                target,
-                tolerance_voxels=eval_config.alignment_tolerance_voxels,
-            )
-            frame_label = (anchor.metadata or {}).get("frame", anchor_index)
-            record = {
-                "anchor_position": anchor_position,
-                "anchor_index": anchor_index,
-                "frame": frame_label,
-                "previous_overlap_ratio": previous_overlap,
-                "future_overlap_ratio": future_overlap,
-                "previous_near_overlap_ratio": previous_near_overlap,
-                "future_near_overlap_ratio": future_near_overlap,
-            }
-            alignment_records.append(record)
-            try:
-                alignment_images.append(
-                    save_bev_comparison(
-                        baseline=anchor.grid,
-                        temporal=previous_aligned,
-                        target=target,
-                        output_path=alignment_dir
-                        / f"alignment_frame_{anchor_position:05d}_{frame_label}.png",
-                        title=f"Frame {frame_label} temporal alignment diagnostic",
-                        class_names=class_names,
-                        panel_titles=("Current t", "Previous aligned to t", "Future target in t"),
-                    )
-                )
-                record["image_path"] = str(alignment_images[-1])
-            except Exception as exc:
-                error_name = type(exc).__name__
-                visualization_errors[error_name] = visualization_errors.get(error_name, 0) + 1
-
-    baseline_summary = summarize_iou(baseline_iou_results)
-    ablation_rows: list[dict[str, Any]] = []
-    for (profile_name, threshold), results in ablation_iou_results.items():
-        summary = summarize_iou(results)
-        row = {
-            "profile": profile_name,
-            "occupancy_threshold": threshold,
-            "classes": {
-                str(class_id): {
-                    "class_name": class_names.get(class_id, str(class_id)),
-                    **_class_row(summary, class_id),
+            align_records.append(
+                {
+                    "anchor_position": pos,
+                    "anchor_index": a_idx,
+                    "frame": lbl,
+                    "previous_overlap_ratio": _occupied_overlap_ratio(anchor.grid, prev_aligned),
+                    "future_overlap_ratio": _occupied_overlap_ratio(anchor.grid, target),
+                    "previous_near_overlap_ratio": _occupied_near_overlap_ratio(
+                        anchor.grid, prev_aligned, tolerance_voxels=cfg.alignment_tolerance_voxels
+                    ),
+                    "future_near_overlap_ratio": _occupied_near_overlap_ratio(
+                        anchor.grid, target, tolerance_voxels=cfg.alignment_tolerance_voxels
+                    ),
+                    **({"image_path": str(img)} if img else {}),
                 }
-                for class_id in eval_config.class_ids
+            )
+
+    ablation_rows = [
+        {
+            "profile": p_name,
+            "occupancy_threshold": th,
+            "classes": {
+                str(cid): {
+                    "class_name": class_names.get(cid, str(cid)),
+                    **_class_row(summarize_iou(res), cid),
+                }
+                for cid in cfg.class_ids
             },
         }
-        ablation_rows.append(row)
-
+        for (p_name, th), res in ablation_iou_results.items()
+    ]
     best_row = max(ablation_rows, key=_ablation_row_score)
-    best_profile = next(
-        profile for profile in eval_config.fusion_profiles if profile.name == best_row["profile"]
-    )
-    best_threshold = float(best_row["occupancy_threshold"])
+    best_prof = next(p for p in cfg.fusion_profiles if p.name == best_row["profile"])
+    best_th = float(cast(float, best_row["occupancy_threshold"]))
 
-    temporal_iou_results: list[Mapping[int, ClassIoU]] = []
-    for anchor_index in anchors:
-        past_frames = frames[anchor_index - eval_config.past_window + 1 : anchor_index + 1]
-        fused = fuse_occupancy_frames(tuple(reversed(past_frames)), weights=best_profile.weights)
-        temporal_iou_results.append(
+    temporal_summary = summarize_iou(
+        [
             compute_semantic_iou(
-                fused,
-                target_by_anchor[anchor_index],
-                class_ids=eval_config.class_ids,
-                occupancy_threshold=best_threshold,
+                fuse_occupancy_frames(
+                    tuple(reversed(frames[i - cfg.past_window + 1 : i + 1])),
+                    weights=best_prof.weights,
+                ),
+                target_by_anchor[i],
+                class_ids=cfg.class_ids,
+                occupancy_threshold=best_th,
             )
-        )
-    temporal_summary = summarize_iou(temporal_iou_results)
+            for i in anchors
+        ]
+    )
 
-    baseline_path = write_iou_summary_json(
-        baseline_summary,
-        output_dir / "future_pseudo_baseline_iou_summary.json",
-        class_names=class_names,
-    )
-    temporal_path = write_iou_summary_json(
+    base_p, temp_p, rec_p, clus_p = _write_standard_artifacts(
+        out_dir,
+        "future_pseudo",
+        summarize_iou(baseline_iou_results),
         temporal_summary,
-        output_dir / "future_pseudo_temporal_iou_summary.json",
-        class_names=class_names,
+        shadow_eval,
+        class_names,
     )
-    records_path = shadow_evaluator.write_records_jsonl(
-        output_dir / "future_pseudo_shadow_records.jsonl"
-    )
-    clusters_path = shadow_evaluator.write_cluster_summary_json(
-        output_dir / "future_pseudo_shadow_clusters.json"
-    )
-    ablation_path = _write_json(
-        output_dir / "fusion_ablation_summary.json",
+    ablation_p = _write_json(
+        out_dir / "fusion_ablation_summary.json",
         {
             "selection_rule": "primary vehicle IoU, secondary road IoU; empty-union classes score -1",
-            "selected_profile": best_profile.name,
-            "selected_weights": list(best_profile.weights),
-            "selected_occupancy_threshold": best_threshold,
+            "selected_profile": best_prof.name,
+            "selected_weights": list(best_prof.weights),
+            "selected_occupancy_threshold": best_th,
             "rows": ablation_rows,
         },
     )
-    alignment_path = _write_json(
-        output_dir / "alignment_summary.json",
+    align_stats = {
+        f"mean_{k}": float(np.mean([r[k] for r in align_records])) if align_records else None
+        for k in (
+            "previous_overlap_ratio",
+            "future_overlap_ratio",
+            "previous_near_overlap_ratio",
+            "future_near_overlap_ratio",
+        )
+    }
+    align_p = _write_json(
+        out_dir / "alignment_summary.json",
         {
             "diagnostic": "adjacent and future occupancy transformed into anchor ego frame",
-            "frame_count": len(alignment_records),
-            "near_overlap_tolerance_voxels": eval_config.alignment_tolerance_voxels,
-            "mean_previous_overlap_ratio": (
-                float(np.mean([record["previous_overlap_ratio"] for record in alignment_records]))
-                if alignment_records
-                else None
-            ),
-            "mean_future_overlap_ratio": (
-                float(np.mean([record["future_overlap_ratio"] for record in alignment_records]))
-                if alignment_records
-                else None
-            ),
-            "mean_previous_near_overlap_ratio": (
-                float(
-                    np.mean([record["previous_near_overlap_ratio"] for record in alignment_records])
-                )
-                if alignment_records
-                else None
-            ),
-            "mean_future_near_overlap_ratio": (
-                float(
-                    np.mean([record["future_near_overlap_ratio"] for record in alignment_records])
-                )
-                if alignment_records
-                else None
-            ),
-            "records": alignment_records,
-            "image_paths": [str(path) for path in alignment_images],
+            "frame_count": len(align_records),
+            "near_overlap_tolerance_voxels": cfg.alignment_tolerance_voxels,
+            **align_stats,
+            "records": align_records,
+            "image_paths": [str(p) for p in align_images],
         },
     )
-    summary_path = _write_json(
-        output_dir / "future_pseudo_eval_summary.json",
-        {
-            "evaluation_name": "future_pseudo_label_semantic_occupancy_iou",
-            "dataset_name": eval_config.dataset_name,
-            "split": eval_config.split,
-            "requested_anchor_count": eval_config.anchor_count,
-            "processed_anchor_count": len(anchors),
-            "skipped_anchor_count": max(eval_config.anchor_count - len(anchors), 0),
-            "past_window": eval_config.past_window,
-            "future_window": eval_config.future_window,
-            "selected_profile": best_profile.name,
-            "selected_weights": list(best_profile.weights),
-            "selected_occupancy_threshold": best_threshold,
-            "disagreement_threshold": eval_config.disagreement_threshold,
-            "target_proxy": (
+    summary_p = _write_json(
+        out_dir / "future_pseudo_eval_summary.json",
+        _base_eval_summary(
+            "future_pseudo_label_semantic_occupancy_iou",
+            cfg,
+            class_names,
+            bev_images,
+            vis_errors,
+            requested_anchor_count=cfg.anchor_count,
+            processed_anchor_count=len(anchors),
+            skipped_anchor_count=max(cfg.anchor_count - len(anchors), 0),
+            past_window=cfg.past_window,
+            future_window=cfg.future_window,
+            selected_profile=best_prof.name,
+            selected_weights=list(best_prof.weights),
+            selected_occupancy_threshold=best_th,
+            target_proxy=(
                 "future union of projected-depth semantic occupancy grids from frames "
                 "t through t+future_window-1 transformed into frame t; this is not dense "
                 "simulator 3D ground truth"
             ),
-            "class_ids": {
-                str(class_id): class_names.get(class_id, str(class_id))
-                for class_id in eval_config.class_ids
-            },
-            "visualization_errors": visualization_errors,
-            "bev_images": [str(path) for path in bev_images],
-            "alignment_images": [str(path) for path in alignment_images],
-            **collection_summary,
-        },
+            alignment_images=[str(p) for p in align_images],
+            **col_summary,
+        ),
     )
 
     return FuturePseudoEvalArtifacts(
-        baseline_iou=baseline_path,
-        temporal_iou=temporal_path,
-        eval_summary=summary_path,
-        shadow_records=records_path,
-        shadow_clusters=clusters_path,
-        alignment_summary=alignment_path,
-        ablation_summary=ablation_path,
+        baseline_iou=base_p,
+        temporal_iou=temp_p,
+        eval_summary=summary_p,
+        shadow_records=rec_p,
+        shadow_clusters=clus_p,
+        alignment_summary=align_p,
+        ablation_summary=ablation_p,
         bev_images=tuple(bev_images),
-        alignment_images=tuple(alignment_images),
+        alignment_images=tuple(align_images),
     )
 
 
@@ -1631,181 +1276,107 @@ def run_bounded_carla_iou_evaluation(
     raw_samples: Iterable[Mapping[str, Any]] | None = None,
 ) -> Phase2CarlaEvalArtifacts:
     """Run bounded Phase 2 evaluation and write notebook-readable artifacts."""
-
-    eval_config = config or Phase2CarlaEvalConfig()
-    preprocessing = eval_config.preprocessing or build_occupancy_preprocessing_config()
-    spec = eval_config.grid_spec or OccupancyGridSpec()
-    class_names = eval_config.class_names or CARLA_CLASS_NAMES
-    output_dir = Path(eval_config.output_dir)
-    bev_dir = output_dir / "bev"
-
-    samples = raw_samples
-    if samples is None:
-        samples = stream_huggingface_samples(eval_config.dataset_name, eval_config.split)
+    cfg = config or Phase2CarlaEvalConfig()
+    preprocessing = cfg.preprocessing or build_occupancy_preprocessing_config()
+    spec = cfg.grid_spec or OccupancyGridSpec()
+    class_names = cfg.class_names or CARLA_CLASS_NAMES
+    out_dir = Path(cfg.output_dir)
+    bev_dir = out_dir / "bev"
+    samples = (
+        raw_samples
+        if raw_samples is not None
+        else stream_huggingface_samples(cfg.dataset_name, cfg.split)
+    )
 
     buffer = TemporalFusionBuffer()
     evaluator = ShadowModeEvaluator(
-        disagreement_threshold=eval_config.disagreement_threshold,
-        occupancy_threshold=eval_config.occupancy_threshold,
-        class_ids=eval_config.class_ids,
+        disagreement_threshold=cfg.disagreement_threshold,
+        occupancy_threshold=cfg.occupancy_threshold,
+        class_ids=cfg.class_ids,
         class_names=class_names,
     )
-    baseline_iou_results: list[Mapping[int, ClassIoU]] = []
-    temporal_iou_results: list[Mapping[int, ClassIoU]] = []
+    baseline_results: list[Mapping[int, ClassIoU]] = []
+    temporal_results: list[Mapping[int, ClassIoU]] = []
     bev_images: list[Path] = []
+    vis_errors: dict[str, int] = {}
+    tracker = _ErrorTracker()
     processed_count = 0
-    skipped_count = 0
-    skipped_errors: dict[str, int] = {}
-    skipped_examples: list[FrameSkipExample] = []
-    visualization_errors: dict[str, int] = {}
 
-    for frame_index, sample in enumerate(islice(samples, eval_config.max_frames)):
+    for idx, sample in enumerate(islice(samples, cfg.max_frames)):
         try:
-            processed, extrinsics = _processed_sample_from_raw(sample, preprocessing=preprocessing)
-            baseline = _grid_from_processed_sample(
-                processed,
-                extrinsics=extrinsics,
-                fov_degrees=preprocessing.fov_degrees,
-                spec=spec,
-            )
-            target = baseline
-            ego_pose = ego_pose_from_sample(sample)
-            fused = buffer.add(
-                OccupancyFrame(
-                    baseline,
-                    ego_pose,
-                    metadata=dict(processed["metadata"]),
-                )
-            )
-            temporal = fused_to_semantic_grid(
-                fused,
-                occupancy_threshold=eval_config.occupancy_threshold,
-            )
+            frame = _frame_from_sample(sample, preprocessing=preprocessing, spec=spec)
+            fused = buffer.add(frame)
+            temporal = fused_to_semantic_grid(fused, occupancy_threshold=cfg.occupancy_threshold)
 
-            baseline_iou_results.append(
-                compute_semantic_iou(baseline, target, class_ids=eval_config.class_ids)
+            baseline_results.append(
+                compute_semantic_iou(frame.grid, frame.grid, class_ids=cfg.class_ids)
             )
-            temporal_iou_results.append(
+            temporal_results.append(
                 compute_semantic_iou(
                     fused,
-                    target,
-                    class_ids=eval_config.class_ids,
-                    occupancy_threshold=eval_config.occupancy_threshold,
+                    frame.grid,
+                    class_ids=cfg.class_ids,
+                    occupancy_threshold=cfg.occupancy_threshold,
                 )
             )
-            evaluator.evaluate_frame(
-                baseline=baseline,
-                improved=fused,
-                metadata=dict(processed["metadata"]),
-            )
+            evaluator.evaluate_frame(baseline=frame.grid, improved=fused, metadata=frame.metadata)
             processed_count += 1
 
-            should_save_bev = len(bev_images) < eval_config.bev_frame_count
-            should_save_flagged = evaluator.records[-1].flagged and len(bev_images) < (
-                eval_config.bev_frame_count + 2
-            )
-            if should_save_bev or should_save_flagged:
-                frame_label = processed["metadata"].get("frame", frame_index)
-                try:
-                    bev_images.append(
-                        save_bev_comparison(
-                            baseline=baseline,
-                            temporal=temporal,
-                            target=target,
-                            output_path=bev_dir / f"bev_frame_{frame_index:05d}_{frame_label}.png",
-                            title=f"Frame {frame_label} projected-depth proxy occupancy",
-                            class_names=class_names,
-                        )
-                    )
-                except Exception as exc:
-                    error_name = type(exc).__name__
-                    visualization_errors[error_name] = visualization_errors.get(error_name, 0) + 1
-        except Exception as exc:
-            skipped_count += 1
-            error_name = type(exc).__name__
-            skipped_errors[error_name] = skipped_errors.get(error_name, 0) + 1
-            if len(skipped_examples) < 5:
-                skipped_examples.append(
-                    FrameSkipExample(
-                        frame_index=frame_index,
-                        run_id=None if sample is None else sample.get("run_id"),
-                        frame=None if sample is None else sample.get("frame"),
-                        error_type=error_name,
-                        message=str(exc),
-                    )
+            if len(bev_images) < cfg.bev_frame_count or (
+                evaluator.records[-1].flagged and len(bev_images) < cfg.bev_frame_count + 2
+            ):
+                lbl = (frame.metadata or {}).get("frame", idx)
+                _try_save_bev(
+                    baseline=frame.grid,
+                    temporal=temporal,
+                    target=frame.grid,
+                    output_path=bev_dir / f"bev_frame_{idx:05d}_{lbl}.png",
+                    title=f"Frame {lbl} projected-depth proxy occupancy",
+                    class_names=class_names,
+                    error_tracker=vis_errors,
+                    images=bev_images,
                 )
+        except Exception as exc:
+            tracker.record(exc, idx, sample)
 
-    if processed_count == 0:
-        details = "; ".join(
-            f"{example.error_type} at index {example.frame_index} "
-            f"(run_id={example.run_id}, frame={example.frame}): {example.message}"
-            for example in skipped_examples
-        )
-        raise RuntimeError(
-            "No frames were processed successfully; cannot write IoU summaries. "
-            f"Skipped errors: {skipped_errors}. Examples: {details}"
-        )
+    tracker.raise_if_empty(processed_count)
 
-    baseline_summary = summarize_iou(baseline_iou_results)
-    temporal_summary = summarize_iou(temporal_iou_results)
-    baseline_path = write_iou_summary_json(
-        baseline_summary,
-        output_dir / "carla_baseline_iou_summary.json",
-        class_names=class_names,
+    base_p, temp_p, rec_p, clus_p = _write_standard_artifacts(
+        out_dir,
+        "carla",
+        summarize_iou(baseline_results),
+        summarize_iou(temporal_results),
+        evaluator,
+        class_names,
     )
-    temporal_path = write_iou_summary_json(
-        temporal_summary,
-        output_dir / "carla_temporal_iou_summary.json",
-        class_names=class_names,
-    )
-    records_path = evaluator.write_records_jsonl(output_dir / "carla_shadow_mode_records.jsonl")
-    clusters_path = evaluator.write_cluster_summary_json(
-        output_dir / "carla_shadow_mode_clusters.json"
-    )
-    summary_path = _write_json(
-        output_dir / "carla_evaluation_run_summary.json",
-        {
-            "evaluation_name": "current_frame_proxy_agreement_diagnostic",
-            "dataset_name": eval_config.dataset_name,
-            "split": eval_config.split,
-            "requested_max_frames": eval_config.max_frames,
-            "processed_frame_count": processed_count,
-            "skipped_frame_count": skipped_count,
-            "skipped_errors": skipped_errors,
-            "skipped_examples": [example.__dict__ for example in skipped_examples],
-            "visualization_errors": visualization_errors,
-            "occupancy_threshold": eval_config.occupancy_threshold,
-            "disagreement_threshold": eval_config.disagreement_threshold,
-            "target_proxy": (
+    summary_p = _write_json(
+        out_dir / "carla_evaluation_run_summary.json",
+        _base_eval_summary(
+            "current_frame_proxy_agreement_diagnostic",
+            cfg,
+            class_names,
+            bev_images,
+            vis_errors,
+            requested_max_frames=cfg.max_frames,
+            processed_frame_count=processed_count,
+            target_proxy=(
                 "current-frame occupancy grid from LiDAR-converted projected depth and "
                 "front semantic segmentation; this is a diagnostic agreement check, not "
                 "final IoU or dense simulator 3D ground truth"
             ),
-            "class_ids": {
-                str(class_id): class_names.get(class_id, str(class_id))
-                for class_id in eval_config.class_ids
-            },
-            "free_space_note": (
+            free_space_note=(
                 "Free space IoU is not reported because this occupancy representation stores "
                 "observed occupied voxels and does not raycast explicit free-space labels."
             ),
-            "bev_images": [str(path) for path in bev_images],
-        },
+            **tracker.summary(cfg.max_frames, processed_count),
+        ),
     )
 
-    return Phase2CarlaEvalArtifacts(
-        baseline_iou=baseline_path,
-        temporal_iou=temporal_path,
-        shadow_records=records_path,
-        shadow_clusters=clusters_path,
-        run_summary=summary_path,
-        bev_images=tuple(bev_images),
-    )
+    return Phase2CarlaEvalArtifacts(base_p, temp_p, rec_p, clus_p, summary_p, tuple(bev_images))
 
 
 def iter_shadow_records(path: str | Path) -> Iterator[dict[str, Any]]:
     """Yield JSONL shadow-mode records from an artifact path."""
-
     with Path(path).open("r", encoding="utf-8") as handle:
         for line in handle:
             if line.strip():
