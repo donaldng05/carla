@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Project Constitution & Architecture"
+    url: "https://github.com/donaldng05/carla/tree/main/docs"
+    about: "Read the project governance, constitution, and phase plans before opening issues."

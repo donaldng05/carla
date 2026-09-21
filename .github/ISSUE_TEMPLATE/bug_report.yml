@@ -1,0 +1,57 @@
+name: "🐛 Bug Report"
+description: "Report an issue, regression, or geometric inconsistency"
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue! Please ensure that geometry bugs describe the expected vs. actual transformation coordinates.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of the system is affected?
+      options:
+        - "src/transforms (Coordinate Math)"
+        - "src/perception (Occupancy & Temporal Fusion)"
+        - "src/data (Dataset & Preprocessing)"
+        - "src/evaluation (IoU & Shadow Mode)"
+        - "CI / Infrastructure"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem Description
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this? Include code snippets or commands.
+      placeholder: |
+        1. Run `uv run pytest tests/test_transforms.py`
+        2. Inspect output...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. Actual Behavior
+      description: Describe what you expected to happen vs. what actually occurred.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: System Environment
+      description: OS, Python version, uv version, GPU availability.
+      placeholder: |
+        - OS: Windows 11 / Ubuntu 22.04
+        - Python version: 3.11
+        - uv version: 0.12.1
+    validations:
+      required: false
