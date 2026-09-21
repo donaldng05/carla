@@ -75,24 +75,22 @@ def test_main_returns_one_when_overlap(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exit_code == 1
 
 
-def test_audit_huggingface_split_run_ids_uses_datasets_server_strategy(
+def test_audit_huggingface_split_run_ids_uses_datasets_streaming(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    mock_samples = {
+        "train": [{"run_id": "run_020"}],
+        "validation": [{"run_id": "run_008"}],
+        "test": [{"run_id": "run_001"}],
+    }
     monkeypatch.setattr(
-        "src.data.split_audit.audit_huggingface_split_run_ids_via_datasets_server",
-        lambda **_: {
-            "has_overlap": False,
-            "overlaps": {},
-            "audit_strategy": "datasets_server",
-            "is_definitive": False,
-            "notes": "bounded evidence audit",
-            "runs_by_split": {"train": ["run_020"], "validation": ["run_008"], "test": ["run_001"]},
-            "run_counts": {"train": 1, "validation": 1, "test": 1},
-            "inspected_counts": {"train": 25, "validation": 25, "test": 25},
-        },
+        "src.data.split_audit._load_hf_split",
+        lambda _dataset, split, **_: mock_samples[split],
     )
 
     report = audit_huggingface_split_run_ids()
 
-    assert report["audit_strategy"] == "datasets_server"
-    assert report["is_definitive"] is False
+    assert report["audit_strategy"] == "datasets"
+    assert report["is_definitive"] is True
+    assert report["has_overlap"] is False
+    assert report["run_counts"] == {"train": 1, "validation": 1, "test": 1}
