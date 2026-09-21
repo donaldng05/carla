@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import numpy as np
 

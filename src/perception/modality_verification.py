@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -242,9 +243,7 @@ def resolve_calibration_status(
             image_key=image_key,
             fov_degrees=fov_degrees,
         )
-        intrinsics_source = (
-            f"{DATASET_DERIVED_INTRINSICS_LABEL} " f"(image shape + FOV={fov_degrees})"
-        )
+        intrinsics_source = f"{DATASET_DERIVED_INTRINSICS_LABEL} (image shape + FOV={fov_degrees})"
         intrinsics_available = True
 
     extrinsics: np.ndarray | None = None

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from collections import deque
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -20,7 +21,6 @@ from src.data.carla_dataset import (
 from src.evaluation.iou import (
     ClassIoU,
     compute_semantic_iou,
-    iou_table,
     summarize_iou,
     write_iou_summary_json,
 )

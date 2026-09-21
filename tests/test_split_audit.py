@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from src.data.split_audit import audit_huggingface_split_run_ids, format_split_audit_report, main

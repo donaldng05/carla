@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import json
 import logging
 import random
 from pathlib import Path
@@ -14,9 +13,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from src.data.bc_sequences import BehavioralCloningSequenceDataset, collate_bc_sequences
-from src.data.carla_dataset import build_bc_preprocessing_config
-from src.planning.bc_model import build_bc_model
 from src.planning.bc_training import load_checkpoint, run_bc_epoch, save_checkpoint
 
 LOGGER = logging.getLogger(__name__)

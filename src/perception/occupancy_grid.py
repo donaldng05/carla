@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -245,7 +246,7 @@ def make_bev_figure(
         if z_indices.size:
             bev[x_idx, y_idx] = grid.semantic[x_idx, y_idx, z_indices[-1]]
 
-    classes = sorted(set(colors) | set(int(v) for v in np.unique(bev)))
+    classes = sorted(set(colors) | {int(v) for v in np.unique(bev)})
     color_values = [colors.get(cls, "#4c78a8") for cls in classes]
     class_to_index = {cls: idx for idx, cls in enumerate(classes)}
     image = np.vectorize(class_to_index.get)(bev).T
