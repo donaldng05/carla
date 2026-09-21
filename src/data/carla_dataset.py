@@ -87,21 +87,6 @@ def build_occupancy_preprocessing_config() -> CarlaDataPreprocessingConfig:
     return CarlaDataPreprocessingConfig()
 
 
-def build_bc_preprocessing_config(
-    *,
-    target_image_size: tuple[int, int] = (224, 224),
-    normalize_rgb: bool = True,
-    hole_fill: bool = True,
-) -> CarlaDataPreprocessingConfig:
-    """Return the default preprocessing profile for behavioral cloning inputs."""
-
-    return CarlaDataPreprocessingConfig(
-        target_image_size=target_image_size,
-        normalize_rgb=normalize_rgb,
-        hole_fill=hole_fill,
-    )
-
-
 def _load_hf_split(
     dataset_name: str,
     split: str,

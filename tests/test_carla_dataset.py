@@ -12,7 +12,6 @@ from src.data import (
     CarlaDataPreprocessingConfig,
     CarlaMultimodalDataset,
     audit_split_run_ids,
-    build_bc_preprocessing_config,
     build_carla_dataset_from_hf,
     collate_carla_samples,
     validate_processed_dataset,
@@ -126,8 +125,12 @@ def test_dataset_maps_cityscapes_vehicle_family_colors_to_vehicle_class() -> Non
     assert torch.unique(item["segmentation"]).tolist() == [10]
 
 
-def test_bc_preprocessing_resizes_and_normalizes() -> None:
-    config = build_bc_preprocessing_config(target_image_size=(4, 4))
+def test_preprocessing_resizes_and_normalizes() -> None:
+    config = CarlaDataPreprocessingConfig(
+        target_image_size=(4, 4),
+        normalize_rgb=True,
+        hole_fill=True,
+    )
     dataset = CarlaMultimodalDataset([_make_sample()], preprocessing=config)
 
     item = dataset[0]

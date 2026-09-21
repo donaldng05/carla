@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "carla-autopilot-multimodal"
 version = "0.1.0"
-description = "CARLA-based autonomous driving perception project"
+description = "3D semantic occupancy grid with temporal ego-motion fusion for autonomous driving perception"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26",
@@ -25,7 +25,6 @@ dev = [
   "pytest-cov>=5.0",
   "hypothesis>=6.100",
   "types-requests>=2.31",
-  "wandb>=0.17",
   "pre-commit>=3.7",
 ]
 viz = [
