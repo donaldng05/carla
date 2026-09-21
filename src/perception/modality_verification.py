@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -136,56 +136,6 @@ def load_manual_calibration_config(
     return calibration
 
 
-def discover_calibration_fields(
-    sample: Mapping[str, Any],
-    *,
-    key_hints: Sequence[str] = (
-        "intrinsic",
-        "extrinsic",
-        "camera",
-        "lidar",
-        "calib",
-        "rotation",
-        "translation",
-        "transform",
-        "pose",
-        "fov",
-        "sensor",
-    ),
-) -> dict[str, str]:
-    """Return sample fields that look calibration-related.
-
-    The output is a lightweight mapping of field name to a short type/shape summary
-    so notebook inspection can show what calibration-like metadata exists.
-    """
-
-    discovered: dict[str, str] = {}
-    hints = tuple(hint.lower() for hint in key_hints)
-    stack: list[tuple[str, Any]] = [(str(key), value) for key, value in sample.items()]
-
-    while stack:
-        key, value = stack.pop()
-        key_lower = key.lower()
-        if any(hint in key_lower for hint in hints):
-            try:
-                array = np.asarray(value)
-            except Exception:
-                array = None
-
-            if array is not None and array.ndim > 0:
-                discovered[key] = f"array{tuple(int(dim) for dim in array.shape)}"
-            elif isinstance(value, Mapping):
-                discovered[key] = f"mapping[{len(value)}]"
-            else:
-                discovered[key] = type(value).__name__
-
-        if isinstance(value, Mapping):
-            for child_key, child_value in value.items():
-                stack.append((f"{key}.{child_key}", child_value))
-
-    return discovered
-
-
 def resolve_calibration_status(
     sample: Mapping[str, Any],
     *,
@@ -197,7 +147,11 @@ def resolve_calibration_status(
 ) -> dict[str, Any]:
     """Resolve calibration availability and report whether projection is trustworthy."""
 
-    calibration_fields = discover_calibration_fields(sample)
+    calibration_fields = {
+        key: type(sample[key]).__name__
+        for key in (*INTRINSIC_KEYS, *EXTRINSIC_KEYS)
+        if key in sample and sample[key] is not None
+    }
 
     intrinsics: np.ndarray | None = None
     intrinsics_source = "missing"
@@ -404,7 +358,9 @@ def summarize_sample(
             segmentation
         )
 
-    summary["calibration_keys_present"] = sorted(discover_calibration_fields(sample).keys())
+    summary["calibration_keys_present"] = sorted(
+        k for k in (*INTRINSIC_KEYS, *EXTRINSIC_KEYS) if k in sample and sample[k] is not None
+    )
     return summary
 
 
@@ -414,46 +370,6 @@ def take_stream_window(
     target_count: int = 12,
 ) -> list[Mapping[str, Any]]:
     """Take the first N samples from an iterable dataset and stop immediately."""
-
     if target_count <= 0:
         raise ValueError("target_count must be positive")
-
-    selected: list[Mapping[str, Any]] = []
-    for sample in dataset:
-        selected.append(sample)
-        if len(selected) >= target_count:
-            break
-
-    return selected
-
-
-def select_representative_samples(
-    dataset: Iterable[Mapping[str, Any]],
-    *,
-    target_count: int = 12,
-    per_run: int = 2,
-    run_key: str = "run_id",
-) -> list[Mapping[str, Any]]:
-    """Select a small sample set spread across runs."""
-
-    if target_count <= 0:
-        raise ValueError("target_count must be positive")
-    if per_run <= 0:
-        raise ValueError("per_run must be positive")
-
-    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    for sample in dataset:
-        run_id = str(sample.get(run_key, "unknown"))
-        if len(grouped[run_id]) < per_run:
-            grouped[run_id].append(sample)
-
-        if sum(len(items) for items in grouped.values()) >= target_count:
-            break
-
-    selected: list[Mapping[str, Any]] = []
-    for run_id in sorted(grouped):
-        selected.extend(grouped[run_id])
-        if len(selected) >= target_count:
-            return selected[:target_count]
-
-    return selected[:target_count]
+    return list(islice(dataset, target_count))

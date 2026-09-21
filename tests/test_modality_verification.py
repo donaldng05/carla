@@ -4,14 +4,12 @@ from pathlib import Path
 import numpy as np
 
 from src.perception.modality_verification import (
-    discover_calibration_fields,
     estimate_front_camera_intrinsics,
     load_manual_calibration_config,
     resolve_calibration_status,
     resolve_front_camera_intrinsics,
     resolve_lidar_to_camera_extrinsics,
     resolve_projection_inputs,
-    select_representative_samples,
     summarize_depth_map,
     summarize_sample,
     take_stream_window,
@@ -47,20 +45,6 @@ def test_resolve_lidar_to_camera_extrinsics_reads_known_key() -> None:
     transform = resolve_lidar_to_camera_extrinsics(sample)
 
     np.testing.assert_allclose(transform, np.eye(4))
-
-
-def test_discover_calibration_fields_finds_matching_keys() -> None:
-    sample = {
-        "camera_intrinsics": np.eye(3),
-        "metadata": {"lidar_pose": [0.0, 0.0, 0.0]},
-        "run_id": "run-01",
-    }
-
-    discovered = discover_calibration_fields(sample)
-
-    assert "camera_intrinsics" in discovered
-    assert "metadata.lidar_pose" in discovered
-    assert "run_id" not in discovered
 
 
 def test_resolve_projection_inputs_reports_missing_extrinsics() -> None:
@@ -209,36 +193,6 @@ def test_summarize_depth_map_reports_coverage() -> None:
     np.testing.assert_allclose(summary["coverage"], 0.75)
     np.testing.assert_allclose(summary["min_depth"], 1.0)
     np.testing.assert_allclose(summary["max_depth"], 4.0)
-
-
-def test_select_representative_samples_spreads_across_runs() -> None:
-    dataset = [
-        {"run_id": "a", "frame": 0},
-        {"run_id": "a", "frame": 1},
-        {"run_id": "b", "frame": 0},
-        {"run_id": "b", "frame": 1},
-        {"run_id": "c", "frame": 0},
-    ]
-
-    selected = select_representative_samples(dataset, target_count=4, per_run=1)
-
-    assert [sample["run_id"] for sample in selected] == ["a", "b", "c"]
-
-
-def test_select_representative_samples_accepts_iterators() -> None:
-    dataset = iter(
-        [
-            {"run_id": "a", "frame": 0},
-            {"run_id": "a", "frame": 1},
-            {"run_id": "b", "frame": 0},
-            {"run_id": "c", "frame": 0},
-            {"run_id": "c", "frame": 1},
-        ]
-    )
-
-    selected = select_representative_samples(dataset, target_count=3, per_run=1)
-
-    assert [sample["run_id"] for sample in selected] == ["a", "b", "c"]
 
 
 def test_take_stream_window_stops_at_target_count() -> None:
