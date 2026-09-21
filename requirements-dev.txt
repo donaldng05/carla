@@ -1,9 +1,0 @@
--r requirements.txt
-datasets>=2.19
-black>=24.0
-isort>=5.13
-mypy>=1.8
-pytest>=8.0
-hypothesis>=6.100
-types-requests>=2.31
-matplotlib>=3.8

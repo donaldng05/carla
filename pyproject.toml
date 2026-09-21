@@ -17,13 +17,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "ruff>=0.7.0",
   "black>=24.0",
   "isort>=5.13",
   "mypy>=1.8",
   "pytest>=8.0",
+  "pytest-cov>=5.0",
   "hypothesis>=6.100",
   "types-requests>=2.31",
   "wandb>=0.17",
+  "pre-commit>=3.7",
 ]
 viz = [
   "matplotlib>=3.8",
@@ -45,8 +48,34 @@ profile = "black"
 line_length = 100
 src_paths = ["src", "tests"]
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes
+  "I",    # isort
+  "B",    # flake8-bugbear
+  "UP",   # pyupgrade
+  "C4",   # flake8-comprehensions
+]
+ignore = [
+  "E501", # line length handled by formatter
+  "B905", # zip strict requirement
+  "E402", # module level imports after pytest.importorskip
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
 [tool.mypy]
-python_version = "3.10"
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -59,4 +88,17 @@ files = ["src", "tests"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-q"
+addopts = "-q -o cache_dir=.venv/.pytest_cache"
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+  "pragma: no cover",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+  "if TYPE_CHECKING:",
+]
