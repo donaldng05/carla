@@ -51,21 +51,61 @@ CARLA_CLASS_NAMES = {
 }
 DEFAULT_CLASS_IDS = tuple(CARLA_CLASS_NAMES)
 BEV_CLASS_NAMES = {
+    0: "unlabeled",
     1: "building",
+    2: "fence",
+    3: "other",
     4: "pedestrian",
+    5: "pole",
     6: "road line",
     7: "road",
     8: "sidewalk",
+    9: "vegetation",
     10: "vehicle",
+    11: "wall",
+    12: "traffic sign",
+    13: "sky",
+    14: "ground",
+    15: "bridge",
+    16: "rail track",
+    17: "guard rail",
+    18: "traffic light",
+    19: "static",
+    20: "dynamic",
+    21: "water",
+    22: "terrain",
+    23: "rider",
+    24: "bicycle",
+    25: "truck",
 }
 BEV_CLASS_COLORS = {
-    UNKNOWN_CLASS: "#ffffff",
+    UNKNOWN_CLASS: "#e8e8e8",
+    0: "#d9d9d9",
     1: "#b9c7d8",
+    2: "#a8a8a8",
+    3: "#bbbbbb",
     4: "#f2a23a",
+    5: "#8c8c8c",
     6: "#6aa5ff",
     7: "#777777",
     8: "#c7c7c7",
+    9: "#7fae7f",
     10: "#c83f49",
+    11: "#9e9e9e",
+    12: "#e5c548",
+    13: "#a9d6f5",
+    14: "#8d8d8d",
+    15: "#b0a89f",
+    16: "#969696",
+    17: "#b5b5b5",
+    18: "#e8845a",
+    19: "#c2c2c2",
+    20: "#d48bc0",
+    21: "#7fb3d5",
+    22: "#a3c48b",
+    23: "#f2a23a",
+    24: "#b565d8",
+    25: "#8e2f38",
 }
 
 
@@ -408,22 +448,67 @@ def _topdown_semantic_image(grid: SemanticOccupancyGrid) -> np.ndarray:
     return image.T
 
 
-def _crop_panels_to_occupied(panels: list[np.ndarray], *, padding: int = 8) -> list[np.ndarray]:
+def _pretty_slice_name(slice_name: str) -> str:
+    """Humanize an internal slice slug for figure subtitles."""
+    return slice_name.replace("_", " ").strip().capitalize()
+
+
+def _occupied_bbox(
+    panels: list[np.ndarray], *, padding: int = 24, min_extent: int = 48
+) -> tuple[int, int, int, int]:
+    """Bounding box around occupied cells with padding and minimum context."""
     occupied = np.zeros(panels[0].shape, dtype=bool)
     for panel in panels:
         occupied |= panel != UNKNOWN_CLASS
     rows, cols = np.nonzero(occupied)
     if rows.size == 0:
-        return panels
-    r0, r1 = (
-        max(int(rows.min()) - padding, 0),
-        min(int(rows.max()) + padding + 1, panels[0].shape[0]),
-    )
-    c0, c1 = (
-        max(int(cols.min()) - padding, 0),
-        min(int(cols.max()) + padding + 1, panels[0].shape[1]),
-    )
+        r0, c0 = 0, 0
+        r1, c1 = panels[0].shape[0], panels[0].shape[1]
+        return (r0, r1, c0, c1)
+    r0 = max(int(rows.min()) - padding, 0)
+    r1 = min(int(rows.max()) + padding + 1, panels[0].shape[0])
+    c0 = max(int(cols.min()) - padding, 0)
+    c1 = min(int(cols.max()) + padding + 1, panels[0].shape[1])
+    if (r1 - r0) < min_extent:
+        center = (r0 + r1) // 2
+        half = min_extent // 2
+        r0 = max(center - half, 0)
+        r1 = min(r0 + min_extent, panels[0].shape[0])
+        r0 = max(r1 - min_extent, 0)
+    if (c1 - c0) < min_extent:
+        center = (c0 + c1) // 2
+        half = min_extent // 2
+        c0 = max(center - half, 0)
+        c1 = min(c0 + min_extent, panels[0].shape[1])
+        c0 = max(c1 - min_extent, 0)
+    return (r0, r1, c0, c1)
+
+
+def _crop_panels_to_occupied(
+    panels: list[np.ndarray], *, padding: int = 24, min_extent: int = 48
+) -> list[np.ndarray]:
+    r0, r1, c0, c1 = _occupied_bbox(panels, padding=padding, min_extent=min_extent)
     return [panel[r0:r1, c0:c1] for panel in panels]
+
+
+def _ego_pixel_in_crop(
+    spec: OccupancyGridSpec, bbox: tuple[int, int, int, int], cropped_shape: tuple[int, int]
+) -> tuple[float, float] | None:
+    """Ego-vehicle pixel in cropped BEV coordinates, or None when outside view."""
+    voxel = float(spec.voxel_size_m)
+    if voxel <= 0:
+        return None
+    ego_x_idx = int((0.0 - spec.x_range_m[0]) / voxel)
+    ego_y_idx = int((0.0 - spec.y_range_m[0]) / voxel)
+    # _topdown_semantic_image transposes [x, y] into [row=y, col=x].
+    ego_row_full = ego_y_idx
+    ego_col_full = ego_x_idx
+    r0, _, c0, _ = bbox
+    ego_row = ego_row_full - r0
+    ego_col = ego_col_full - c0
+    if 0 <= ego_row < cropped_shape[0] and 0 <= ego_col < cropped_shape[1]:
+        return (float(ego_col), float(ego_row))
+    return None
 
 
 def save_bev_comparison(
@@ -435,8 +520,12 @@ def save_bev_comparison(
     title: str,
     class_names: Mapping[int, str],
     panel_titles: tuple[str, str, str] = ("Baseline", "Temporal fusion", "Target proxy"),
+    subtitle: str = "",
+    highlight_recovered: bool = True,
 ) -> Path:
     """Save baseline, temporal, and target-proxy BEV grids side by side."""
+    # Inline matplotlib import is intentional: visualization is an optional
+    # dependency and must not become a hard import for headless eval workers.
     try:
         import matplotlib
 
@@ -447,37 +536,165 @@ def save_bev_comparison(
     except ImportError as exc:
         raise ImportError("matplotlib is required for BEV comparison output") from exc
 
-    panel_arrays = _crop_panels_to_occupied(
-        [
-            _topdown_semantic_image(baseline),
-            _topdown_semantic_image(temporal),
-            _topdown_semantic_image(target),
-        ]
-    )
+    full_panels = [
+        _topdown_semantic_image(baseline),
+        _topdown_semantic_image(temporal),
+        _topdown_semantic_image(target),
+    ]
+    bbox = _occupied_bbox(full_panels, padding=24, min_extent=48)
+    r0, r1, c0, c1 = bbox
+    panel_arrays = [panel[r0:r1, c0:c1] for panel in full_panels]
+    spec = baseline.spec
+    voxel_size_m = float(spec.voxel_size_m)
     colors = BEV_CLASS_COLORS
     display_names = BEV_CLASS_NAMES | dict(class_names)
-    observed_classes = {int(v) for p in panel_arrays for v in np.unique(p)}
-    classes = sorted(set(colors) | set(class_names) | observed_classes)
-    class_to_index = {cls: i for i, cls in enumerate(classes)}
-    cmap = mcolors.ListedColormap([colors.get(c, "#4c78a8") for c in classes])
+    observed_classes = sorted(
+        {int(v) for p in panel_arrays for v in np.unique(p) if int(v) != UNKNOWN_CLASS}
+    )
+    ordered_classes = [UNKNOWN_CLASS, *observed_classes]
+    class_to_index = {cls: i for i, cls in enumerate(ordered_classes)}
+    cmap_colors = [
+        colors.get(UNKNOWN_CLASS, "#e8e8e8"),
+        *(colors.get(c, "#4c78a8") for c in observed_classes),
+    ]
+    cmap = mcolors.ListedColormap(cmap_colors)
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 5.2), constrained_layout=False)
+    fig.subplots_adjust(top=0.82, bottom=0.22, left=0.04, right=0.98, wspace=0.12)
+    baseline_panel, temporal_panel, target_panel = panel_arrays
+    recovered_mask = (
+        (temporal_panel == target_panel)
+        & (temporal_panel != UNKNOWN_CLASS)
+        & (baseline_panel != temporal_panel)
+    )
+    ego_xy = _ego_pixel_in_crop(spec, bbox, panel_arrays[0].shape)
+    scale_pixels = 10.0 / voxel_size_m if voxel_size_m > 0 else 40.0
     for ax, (panel_title, panel) in zip(axes, zip(panel_titles, panel_arrays)):
         indexed = np.vectorize(class_to_index.__getitem__)(panel)
-        ax.imshow(indexed, origin="lower", cmap=cmap, interpolation="nearest")
-        ax.set_title(panel_title)
-        ax.axis("off")
+        ax.imshow(
+            indexed,
+            origin="lower",
+            cmap=cmap,
+            interpolation="nearest",
+            vmin=0,
+            vmax=len(ordered_classes) - 1,
+        )
+        ax.set_title(panel_title, fontsize=10)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+        if ego_xy is not None:
+            ax.plot(
+                ego_xy[0],
+                ego_xy[1],
+                marker="^",
+                color="black",
+                markersize=9,
+                markeredgecolor="white",
+                markeredgewidth=1.0,
+                linestyle="None",
+                zorder=5,
+            )
+            ax.annotate(
+                "ego",
+                xy=ego_xy,
+                xytext=(-30, 10),
+                textcoords="offset points",
+                fontsize=7,
+                color="black",
+                ha="right",
+                bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "0.6", "alpha": 0.9},
+            )
+            ax.annotate(
+                "",
+                xy=(ego_xy[0], ego_xy[1] + 12),
+                xytext=ego_xy,
+                arrowprops={"arrowstyle": "->", "color": "black", "linewidth": 1.2},
+            )
+        bar_x0 = 4.0
+        bar_y0 = 4.0
+        ax.plot(
+            [bar_x0, bar_x0 + scale_pixels],
+            [bar_y0, bar_y0],
+            color="black",
+            linewidth=2.5,
+            solid_capstyle="butt",
+            zorder=5,
+        )
+        ax.text(
+            bar_x0,
+            bar_y0 + 2.0,
+            "10 m",
+            fontsize=7,
+            color="black",
+            va="bottom",
+            ha="left",
+            bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "none", "alpha": 0.85},
+        )
+        if highlight_recovered and ax is axes[1] and np.any(recovered_mask):
+            ys, xs = np.nonzero(recovered_mask)
+            x0, x1 = float(np.min(xs)) - 1.5, float(np.max(xs)) + 1.5
+            y0, y1 = float(np.min(ys)) - 1.5, float(np.max(ys)) + 1.5
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (x0, y0),
+                    x1 - x0,
+                    y1 - y0,
+                    fill=False,
+                    edgecolor="#b58900",
+                    linewidth=1.8,
+                    linestyle="--",
+                    zorder=4,
+                )
+            )
+            cx = float(np.mean(xs))
+            ax.annotate(
+                "recovered",
+                xy=(cx, y1),
+                xytext=(0, 12),
+                textcoords="offset points",
+                fontsize=7,
+                color="black",
+                ha="center",
+                bbox={"boxstyle": "round,pad=0.2", "fc": "#ffd400", "ec": "0.6", "alpha": 0.95},
+                arrowprops={"arrowstyle": "->", "color": "black", "linewidth": 1.0},
+                zorder=6,
+            )
 
     handles = [
-        mpatches.Patch(color=colors.get(c, "#4c78a8"), label=display_names.get(c, f"class {c}"))
-        for c in classes
-        if c != UNKNOWN_CLASS
+        mpatches.Patch(color=colors.get(c, "#4c78a8"), label=display_names.get(c, f"unknown {c}"))
+        for c in observed_classes
     ]
-    fig.suptitle(title)
-    fig.legend(handles=handles, loc="lower center", ncol=max(1, len(handles)))
-    fig.savefig(path, dpi=140)
+    fig.suptitle(title, fontsize=12, y=0.98)
+    if subtitle:
+        fig.text(0.5, 0.92, subtitle, ha="center", fontsize=8, color="#333333")
+    if handles:
+        fig.legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.08),
+            ncol=min(len(handles), 6),
+            fontsize=8,
+            title="Classes shown",
+            title_fontsize=8,
+            frameon=False,
+        )
+    width_m = (c1 - c0) * voxel_size_m
+    height_m = (r1 - r0) * voxel_size_m
+    fig.text(
+        0.5,
+        0.01,
+        f"Bird's-eye view, {width_m:.0f} m by {height_m:.0f} m at {voxel_size_m:.2f} m/voxel. "
+        "Black triangle is the ego vehicle, arrow points forward. "
+        "Dashed box in the middle panel marks voxels recovered by temporal memory and confirmed by the denser target.",
+        ha="center",
+        fontsize=7,
+        color="#555555",
+    )
+    fig.savefig(path, dpi=160, facecolor="white")
     plt.close(fig)
     return path
 
@@ -493,6 +710,8 @@ def _try_save_bev(
     panel_titles: tuple[str, str, str] = ("Baseline", "Temporal fusion", "Target proxy"),
     error_tracker: dict[str, int],
     images: list[Path] | None = None,
+    subtitle: str = "",
+    highlight_recovered: bool = True,
 ) -> Path | None:
     """Save BEV comparison and record any visualization errors safely."""
     try:
@@ -504,6 +723,8 @@ def _try_save_bev(
             title=title,
             class_names=class_names,
             panel_titles=panel_titles,
+            subtitle=subtitle,
+            highlight_recovered=highlight_recovered,
         )
         if images is not None:
             images.append(path)
@@ -976,9 +1197,10 @@ def run_scenario_memory_evaluation(
                 temporal=c.temporal,
                 target=c.target,
                 output_path=bev_dir / s_name / f"{s_name}_{c.anchor.anchor_index:05d}_{lbl}.png",
-                title=f"{s_name}: frame {lbl} future pseudo-label occupancy",
+                title=f"Occlusion recovery, anchor {lbl}",
+                subtitle=f"{_pretty_slice_name(s_name)} slice: single frame vs 5-frame memory vs denser future target",
                 class_names=class_names,
-                panel_titles=("Baseline t", "Past temporal fusion", "Future pseudo-label"),
+                panel_titles=("Single frame", "5-frame memory", "Denser future target"),
                 error_tracker=vis_errors,
                 images=bev_images,
             )
@@ -1120,9 +1342,10 @@ def run_future_pseudo_label_evaluation(
                 temporal=temporal,
                 target=target,
                 output_path=bev_dir / f"future_pseudo_bev_{pos:05d}_{lbl}.png",
-                title=f"Frame {lbl} future pseudo-label occupancy",
+                title=f"Temporal memory, frame {lbl}",
+                subtitle="Single frame vs 5-frame memory vs denser future target",
                 class_names=class_names,
-                panel_titles=("Baseline t", "Past temporal fusion", "Future pseudo-label"),
+                panel_titles=("Single frame", "5-frame memory", "Denser future target"),
                 error_tracker=vis_errors,
                 images=bev_images,
             )
@@ -1137,9 +1360,10 @@ def run_future_pseudo_label_evaluation(
                 temporal=prev_aligned,
                 target=target,
                 output_path=align_dir / f"alignment_frame_{pos:05d}_{lbl}.png",
-                title=f"Frame {lbl} temporal alignment diagnostic",
+                title=f"Alignment check, frame {lbl}",
+                subtitle="Current frame vs previous frame aligned vs future target in same frame",
                 class_names=class_names,
-                panel_titles=("Current t", "Previous aligned to t", "Future target in t"),
+                panel_titles=("Current frame", "Previous aligned", "Future target"),
                 error_tracker=vis_errors,
                 images=align_images,
             )
@@ -1331,8 +1555,10 @@ def run_bounded_carla_iou_evaluation(
                     temporal=temporal,
                     target=frame.grid,
                     output_path=bev_dir / f"bev_frame_{idx:05d}_{lbl}.png",
-                    title=f"Frame {lbl} projected-depth proxy occupancy",
+                    title=f"Single-frame check, frame {lbl}",
+                    subtitle="Sparse projected-depth occupancy from one frame",
                     class_names=class_names,
+                    panel_titles=("Single frame", "5-frame memory", "Same-frame reference"),
                     error_tracker=vis_errors,
                     images=bev_images,
                 )
