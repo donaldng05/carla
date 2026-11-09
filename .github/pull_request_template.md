@@ -6,7 +6,7 @@
 
 ---
 
-## Governance Check (Mandatory per `AGENT_INSTRUCTIONS.md`)
+## Governance Check (Mandatory per `.agents/AGENT_INSTRUCTIONS.md`)
 
 - [ ] **Phase Alignment:** Which phase does this PR belong to? (e.g., Phase 1, Phase 2, etc.)
 - [ ] **Tier Classification:**
